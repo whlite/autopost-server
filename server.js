@@ -81,7 +81,8 @@ app.post('/describe', async (req, res) => {
     const includeMileage = settings.chkMileage !== false;
     const extra = (settings.aiInstructions || '').trim();
     const dealerText = (vehicle.dealerDescription || '').slice(0, 1500);
-    const prompt =
+    // Use prompt from extension if provided (it has full vehicle knowledge)
+    const prompt = settings.promptOverride ||
       'Write a Facebook Marketplace vehicle listing.\n\nEXACT FORMAT:\n[Year] [Make] [Model]\n' +
       '- Exterior: [color — omit if unknown]\n- Interior: [color — omit if unknown]\n' +
       '- Drivetrain: [AWD/FWD/RWD]\n- Transmission: [type]\n- Engine: [type]\n' +
