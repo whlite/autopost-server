@@ -15,60 +15,96 @@ const SHEET_ID = process.env.SHEET_ID;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const PORT = process.env.PORT || 3000;
 
-// Fetch users from Google Sheet
 async function getUsers() {
-  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Users`;
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
+  console.log('Fetching sheet:', url);
   const res = await fetch(url);
   const text = await res.text();
+  console.log('Sheet raw (first 300):', text.slice(0, 300));
+
   const lines = text.trim().split('\n');
   const users = [];
+
   for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',').map(c => c.replace(/^"|"$/g, '').trim());
-    if (cols[0]) {
-      users.push({
-        username: cols[0].toLowerCase(),
-        password: cols[1],
-        active: cols[2] ? cols[2].toUpperCase() === 'TRUE' : false
-      });
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    // Parse CSV properly handling quoted fields
+    const cols = [];
+    let current = '';
+    let inQuote = false;
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] === '"') {
+        inQuote = !inQuote;
+      } else if (line[c] === ',' && !inQuote) {
+        cols.push(current.trim());
+        current = '';
+      } else {
+        current += line[c];
+      }
+    }
+    cols.push(current.trim());
+
+    const username = (cols[0] || '').toLowerCase().trim();
+    const password = (cols[1] || '').trim();
+    const active = (cols[2] || '').toUpperCase() === 'TRUE';
+
+    if (username && username !== 'username') {
+      users.push({ username, password, active });
     }
   }
+
+  console.log('Parsed users:', users.map(u => ({ username: u.username, active: u.active })));
   return users;
 }
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'AutoPost server running' });
+  res.json({ status: 'AutoPost server running', version: '1.0' });
 });
 
-// Login endpoint
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
+    console.log('Login attempt:', username);
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Missing credentials' });
+    }
 
     const users = await getUsers();
     const user = users.find(u => u.username === username.toLowerCase().trim());
 
-    if (!user) return res.status(401).json({ error: 'Invalid username or password' });
-    if (user.password !== password.trim()) return res.status(401).json({ error: 'Invalid username or password' });
-    if (!user.active) return res.status(403).json({ error: 'Account suspended. Contact support.' });
+    if (!user) {
+      console.log('User not found:', username);
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
 
+    if (user.password !== password.trim()) {
+      console.log('Wrong password for:', username);
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+
+    if (!user.active) {
+      console.log('Inactive user:', username);
+      return res.status(403).json({ error: 'Account suspended. Contact support.' });
+    }
+
+    console.log('Login success:', username);
     res.json({ success: true, message: 'Welcome to AutoPost!' });
+
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ error: 'Server error. Try again.' });
   }
 });
 
-// Generate AI description
 app.post('/describe', async (req, res) => {
   try {
     const { username, password, vehicle, settings } = req.body;
 
-    // Re-verify credentials on every request
     const users = await getUsers();
-    const user = users.find(u => u.username === username.toLowerCase().trim());
-    if (!user || user.password !== password.trim() || !user.active) {
+    const user = users.find(u => u.username === (username || '').toLowerCase().trim());
+    if (!user || user.password !== (password || '').trim() || !user.active) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -88,17 +124,11 @@ app.post('/describe', async (req, res) => {
       (includeMileage && vehicle.mileage ? '- Mileage: ' + Number(vehicle.mileage).toLocaleString() + ' miles\n' : '') +
       '\n' +
       (extra ? 'MANDATORY CUSTOM TEXT (include word for word):\n' + extra + '\n\n' : '') +
-      'RULES:\n' +
-      '- Use your vehicle knowledge for specs\n' +
-      '- Omit Exterior/Interior if unknown\n' +
-      '- NO price, NO VIN, NO stock number\n' +
-      '- Include all custom text exactly\n\n' +
-      'VEHICLE:\n' +
-      'Title: ' + (vehicle.title || '') + '\n' +
-      'Year: ' + (vehicle.year || '') + '\n' +
-      'Exterior color: ' + (vehicle.color || 'unknown') + '\n' +
-      'Mileage: ' + (vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : 'not listed') + '\n' +
-      'Dealer text:\n' + dealerText;
+      'RULES:\n- Use vehicle knowledge for specs\n- Omit color lines if unknown\n- NO price, NO VIN\n- Include all custom text\n\n' +
+      'VEHICLE:\nTitle: ' + (vehicle.title || '') + '\nYear: ' + (vehicle.year || '') +
+      '\nExterior: ' + (vehicle.color || 'unknown') +
+      '\nMileage: ' + (vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : 'not listed') +
+      '\nDealer text:\n' + dealerText;
 
     const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -117,9 +147,10 @@ app.post('/describe', async (req, res) => {
     const data = await aiRes.json();
     const text = data.content && data.content[0] ? data.content[0].text : '';
     res.json({ description: text });
+
   } catch (e) {
     console.error('Describe error:', e);
-    res.status(500).json({ error: 'Server error generating description' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
