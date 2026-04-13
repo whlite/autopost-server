@@ -12,23 +12,21 @@ app.use((req, res, next) => {
 });
 
 const SHEET_ID = '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || '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';
+const CLAUDE_API_KEY = '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';
 const PORT = process.env.PORT || 8080;
 
 console.log('SHEET_ID:', SHEET_ID);
 console.log('PORT:', PORT);
-console.log('API KEY set:', CLAUDE_API_KEY !== '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' && !!CLAUDE_API_KEY);
+console.log('API KEY starts with:', CLAUDE_API_KEY.slice(0, 20));
 
 async function getUsers() {
   const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
-  console.log('Fetching:', url);
+  console.log('Fetching sheet...');
   const res = await fetch(url);
   const text = await res.text();
   console.log('Sheet first 300:', text.slice(0, 300));
-
   const lines = text.trim().split('\n');
   const users = [];
-
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
