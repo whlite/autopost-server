@@ -115,40 +115,50 @@ function buildPrompt(vehicle, settings) {
   const extra = (settings.aiInstructions || '').trim();
   const includeMileage = settings.chkMileage !== false;
   const dealerText = (vehicle.dealerDescription || '').slice(0, 2000);
+  const mileageStr = vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : '';
 
-  let prompt = 'Write a Facebook Marketplace vehicle listing. Use EXACTLY this format:\n\n';
-  prompt += '[Year] [Make] [Model]\n';
-  prompt += '- Exterior Color: [color]\n';
-  prompt += '- Interior Color: [color]\n';
-  prompt += '- Body Style: [SUV/Sedan/Coupe/Truck/etc]\n';
-  prompt += '- Drivetrain: [AWD/FWD/RWD/4WD]\n';
-  prompt += '- Transmission: [e.g. 9-Speed Automatic]\n';
-  prompt += '- Engine: [e.g. 2.0L Turbocharged 4-Cylinder]\n';
-  if (includeMileage && vehicle.mileage) {
-    prompt += '- Mileage: ' + Number(vehicle.mileage).toLocaleString() + ' miles\n';
+  let prompt = '';
+  prompt += 'You are writing a Facebook Marketplace car listing. Write it EXACTLY like this example — no deviations:\n\n';
+  prompt += '--- EXAMPLE OUTPUT ---\n';
+  prompt += '2019 Mercedes-Benz GLC 300\n';
+  prompt += '- Exterior: Polar White\n';
+  prompt += '- Interior: Black\n';
+  prompt += '- Drivetrain: AWD 4MATIC\n';
+  prompt += '- Transmission: 9-Speed Automatic\n';
+  prompt += '- Engine: 2.0L Turbocharged 4-Cylinder\n';
+  prompt += '- Mileage: 66,131 miles\n';
+  prompt += '\n';
+  prompt += 'DM for more info!\n';
+  prompt += '--- END EXAMPLE ---\n\n';
+  prompt += 'NOW WRITE FOR THIS VEHICLE:\n\n';
+  prompt += (vehicle.title || '') + '\n';
+  prompt += '- Exterior: [find in dealer text or use color field]\n';
+  prompt += '- Interior: [find in dealer text]\n';
+  prompt += '- Drivetrain: [use your vehicle knowledge — e.g. AWD 4MATIC, FWD, RWD]\n';
+  prompt += '- Transmission: [use your vehicle knowledge — e.g. 9-Speed Automatic]\n';
+  prompt += '- Engine: [use your vehicle knowledge — e.g. 2.0L Turbocharged 4-Cylinder]\n';
+  if (includeMileage && mileageStr) {
+    prompt += '- Mileage: ' + mileageStr + '\n';
   }
   prompt += '\n';
 
   if (extra) {
-    prompt += '--- MANDATORY ADDITION ---\n';
-    prompt += 'You MUST include this text word for word at the end of the listing:\n';
     prompt += extra + '\n';
-    prompt += '--- END MANDATORY ADDITION ---\n\n';
   }
 
-  prompt += 'STRICT RULES:\n';
-  prompt += '- Use your built-in vehicle knowledge for ALL specs (engine, transmission, drivetrain, horsepower)\n';
-  prompt += '- Extract exterior and interior colors from the dealer text below\n';
-  prompt += '- NEVER write a bullet point with an empty value — omit the entire line if unknown\n';
+  prompt += '\nRULES:\n';
+  prompt += '- Title line is JUST the year make model — NO dashes, NO bullets\n';
+  prompt += '- Each spec is a bullet starting with -\n';
+  prompt += '- NEVER use "Year:", "Make:", "Model:", "Miles:" as bullet labels — those are NOT bullets\n';
+  prompt += '- Omit any bullet where you have no real data\n';
   prompt += '- NO price, NO VIN, NO stock number\n';
-  prompt += '- The mandatory addition text above MUST appear at the end, word for word\n\n';
+  prompt += '- End with the custom text above exactly as written\n\n';
   prompt += 'VEHICLE DATA:\n';
-  prompt += 'Full title: ' + (vehicle.title || '') + '\n';
-  prompt += 'Year: ' + (vehicle.year || '') + '\n';
-  prompt += 'Exterior color from listing: ' + (vehicle.color || 'check dealer text') + '\n';
-  prompt += 'Mileage: ' + (vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : 'not listed') + '\n';
-  prompt += '\nDEALER PAGE TEXT (extract interior color, drivetrain, engine, transmission here):\n';
-  prompt += dealerText || 'No dealer text — use your vehicle knowledge';
+  prompt += 'Title: ' + (vehicle.title || '') + '\n';
+  prompt += 'Exterior color: ' + (vehicle.color || 'check dealer text') + '\n';
+  if (mileageStr) prompt += 'Mileage: ' + mileageStr + '\n';
+  prompt += '\nDEALER PAGE TEXT:\n';
+  prompt += dealerText || 'Not available — use your vehicle knowledge';
 
   return prompt;
 }
