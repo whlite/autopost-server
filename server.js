@@ -17,7 +17,6 @@ const PORT = process.env.PORT || 8080;
 
 console.log('SHEET_ID:', SHEET_ID);
 console.log('PORT:', PORT);
-console.log('API KEY starts with:', CLAUDE_API_KEY.slice(0, 20));
 
 async function getUsers() {
   const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
@@ -79,11 +78,50 @@ app.post('/describe', async (req, res) => {
     }
 
     const extra = (settings.aiInstructions || '').trim();
-    console.log('Generating description for:', vehicle.title);
-    console.log('Custom instructions:', extra || '(none)');
+    const includeMileage = settings.chkMileage !== false;
+    const dealerText = (vehicle.dealerDescription || '').slice(0, 2000);
+    const mileage = vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : '';
 
-    // Build the prompt here on the server so nothing gets lost in transit
-    const prompt = buildPrompt(vehicle, settings);
+    console.log('---');
+    console.log('Vehicle:', vehicle.title);
+    console.log('Custom instructions:', extra || '(none)');
+    console.log('Mileage:', mileage || 'not found');
+    console.log('Dealer text length:', dealerText.length);
+
+    // Build prompt with a concrete example the AI must follow
+    const prompt = `You are writing a Facebook Marketplace car listing. Study this PERFECT example carefully:
+
+EXAMPLE:
+2019 Mercedes-Benz GLC 300
+- Exterior: Polar White
+- Interior: Black
+- Drivetrain: AWD 4MATIC
+- Transmission: 9-Speed Automatic
+- Engine: 2.0L Turbocharged 4-Cylinder
+- Mileage: 66,131 miles
+
+DM for more info! We carry Porsche, Mercedes & Audi.
+
+NOW write the listing for this vehicle using the EXACT same format:
+
+Vehicle title: ${vehicle.title || 'Unknown'}
+Exterior color: ${vehicle.color || 'find in dealer text'}
+${mileage ? 'Mileage: ' + mileage : ''}
+
+Dealer page text (find interior color, drivetrain, engine, transmission here):
+${dealerText || 'Not available'}
+
+RULES YOU MUST FOLLOW:
+1. First line = year make model ONLY. No dashes. No bullets. No extra words.
+2. Each spec = "- Label: Value" format
+3. Use your built-in knowledge for engine/transmission/drivetrain specs for this exact vehicle
+4. Only omit a line if you truly cannot find or know the value
+5. DO NOT write "- Year:", "- Make:", "- Model:", "- Miles:" as bullets - those are WRONG
+6. After the specs, add ONE blank line
+${extra ? '7. Then add this text EXACTLY as written, word for word:\n' + extra : '7. End with: DM for more info!'}
+
+Write the listing now:`;
+
     console.log('Prompt length:', prompt.length);
 
     const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -101,8 +139,10 @@ app.post('/describe', async (req, res) => {
     });
 
     const data = await aiRes.json();
-    const description = data.content && data.content[0] ? data.content[0].text : '';
-    console.log('Description generated:', description.slice(0, 100));
+    const description = data.content && data.content[0] ? data.content[0].text.trim() : '';
+    console.log('Description output:\n' + description);
+    console.log('---');
+
     res.json({ description });
 
   } catch (e) {
@@ -110,57 +150,5 @@ app.post('/describe', async (req, res) => {
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
-
-function buildPrompt(vehicle, settings) {
-  const extra = (settings.aiInstructions || '').trim();
-  const includeMileage = settings.chkMileage !== false;
-  const dealerText = (vehicle.dealerDescription || '').slice(0, 2000);
-  const mileageStr = vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : '';
-
-  let prompt = '';
-  prompt += 'You are writing a Facebook Marketplace car listing. Write it EXACTLY like this example — no deviations:\n\n';
-  prompt += '--- EXAMPLE OUTPUT ---\n';
-  prompt += '2019 Mercedes-Benz GLC 300\n';
-  prompt += '- Exterior: Polar White\n';
-  prompt += '- Interior: Black\n';
-  prompt += '- Drivetrain: AWD 4MATIC\n';
-  prompt += '- Transmission: 9-Speed Automatic\n';
-  prompt += '- Engine: 2.0L Turbocharged 4-Cylinder\n';
-  prompt += '- Mileage: 66,131 miles\n';
-  prompt += '\n';
-  prompt += 'DM for more info!\n';
-  prompt += '--- END EXAMPLE ---\n\n';
-  prompt += 'NOW WRITE FOR THIS VEHICLE:\n\n';
-  prompt += (vehicle.title || '') + '\n';
-  prompt += '- Exterior: [find in dealer text or use color field]\n';
-  prompt += '- Interior: [find in dealer text]\n';
-  prompt += '- Drivetrain: [use your vehicle knowledge — e.g. AWD 4MATIC, FWD, RWD]\n';
-  prompt += '- Transmission: [use your vehicle knowledge — e.g. 9-Speed Automatic]\n';
-  prompt += '- Engine: [use your vehicle knowledge — e.g. 2.0L Turbocharged 4-Cylinder]\n';
-  if (includeMileage && mileageStr) {
-    prompt += '- Mileage: ' + mileageStr + '\n';
-  }
-  prompt += '\n';
-
-  if (extra) {
-    prompt += extra + '\n';
-  }
-
-  prompt += '\nRULES:\n';
-  prompt += '- Title line is JUST the year make model — NO dashes, NO bullets\n';
-  prompt += '- Each spec is a bullet starting with -\n';
-  prompt += '- NEVER use "Year:", "Make:", "Model:", "Miles:" as bullet labels — those are NOT bullets\n';
-  prompt += '- Omit any bullet where you have no real data\n';
-  prompt += '- NO price, NO VIN, NO stock number\n';
-  prompt += '- End with the custom text above exactly as written\n\n';
-  prompt += 'VEHICLE DATA:\n';
-  prompt += 'Title: ' + (vehicle.title || '') + '\n';
-  prompt += 'Exterior color: ' + (vehicle.color || 'check dealer text') + '\n';
-  if (mileageStr) prompt += 'Mileage: ' + mileageStr + '\n';
-  prompt += '\nDEALER PAGE TEXT:\n';
-  prompt += dealerText || 'Not available — use your vehicle knowledge';
-
-  return prompt;
-}
 
 app.listen(PORT, () => console.log('AutoPost running on port', PORT));
