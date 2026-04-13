@@ -78,9 +78,12 @@ app.post('/describe', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Use the full prompt sent from the extension
-    const prompt = settings.promptOverride || buildPrompt(vehicle, settings);
+    const extra = (settings.aiInstructions || '').trim();
     console.log('Generating description for:', vehicle.title);
+    console.log('Custom instructions:', extra || '(none)');
+
+    // Build the prompt here on the server so nothing gets lost in transit
+    const prompt = buildPrompt(vehicle, settings);
     console.log('Prompt length:', prompt.length);
 
     const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -113,18 +116,41 @@ function buildPrompt(vehicle, settings) {
   const includeMileage = settings.chkMileage !== false;
   const dealerText = (vehicle.dealerDescription || '').slice(0, 2000);
 
-  return 'Write a detailed Facebook Marketplace vehicle listing with bullet points.\n\n' +
-    'FORMAT:\n[Year] [Make] [Model]\n' +
-    '- Exterior Color: [color]\n- Interior Color: [color]\n' +
-    '- Body Style: [type]\n- Drivetrain: [AWD/FWD/RWD]\n' +
-    '- Transmission: [type]\n- Engine: [specs and hp]\n' +
-    (includeMileage && vehicle.mileage ? '- Mileage: ' + Number(vehicle.mileage).toLocaleString() + ' miles\n' : '') +
-    '- Condition: [Excellent/Good/Fair]\n\n' +
-    (extra ? extra + '\n\n' : '') +
-    'Use your vehicle knowledge for specs. Extract colors from dealer text.\n\n' +
-    'Title: ' + (vehicle.title || '') + '\n' +
-    'Color: ' + (vehicle.color || 'unknown') + '\n' +
-    'Dealer text:\n' + dealerText;
+  let prompt = 'Write a Facebook Marketplace vehicle listing. Use EXACTLY this format:\n\n';
+  prompt += '[Year] [Make] [Model]\n';
+  prompt += '- Exterior Color: [color]\n';
+  prompt += '- Interior Color: [color]\n';
+  prompt += '- Body Style: [SUV/Sedan/Coupe/Truck/etc]\n';
+  prompt += '- Drivetrain: [AWD/FWD/RWD/4WD]\n';
+  prompt += '- Transmission: [e.g. 9-Speed Automatic]\n';
+  prompt += '- Engine: [e.g. 2.0L Turbocharged 4-Cylinder]\n';
+  if (includeMileage && vehicle.mileage) {
+    prompt += '- Mileage: ' + Number(vehicle.mileage).toLocaleString() + ' miles\n';
+  }
+  prompt += '\n';
+
+  if (extra) {
+    prompt += '--- MANDATORY ADDITION ---\n';
+    prompt += 'You MUST include this text word for word at the end of the listing:\n';
+    prompt += extra + '\n';
+    prompt += '--- END MANDATORY ADDITION ---\n\n';
+  }
+
+  prompt += 'STRICT RULES:\n';
+  prompt += '- Use your built-in vehicle knowledge for ALL specs (engine, transmission, drivetrain, horsepower)\n';
+  prompt += '- Extract exterior and interior colors from the dealer text below\n';
+  prompt += '- NEVER write a bullet point with an empty value — omit the entire line if unknown\n';
+  prompt += '- NO price, NO VIN, NO stock number\n';
+  prompt += '- The mandatory addition text above MUST appear at the end, word for word\n\n';
+  prompt += 'VEHICLE DATA:\n';
+  prompt += 'Full title: ' + (vehicle.title || '') + '\n';
+  prompt += 'Year: ' + (vehicle.year || '') + '\n';
+  prompt += 'Exterior color from listing: ' + (vehicle.color || 'check dealer text') + '\n';
+  prompt += 'Mileage: ' + (vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : 'not listed') + '\n';
+  prompt += '\nDEALER PAGE TEXT (extract interior color, drivetrain, engine, transmission here):\n';
+  prompt += dealerText || 'No dealer text — use your vehicle knowledge';
+
+  return prompt;
 }
 
 app.listen(PORT, () => console.log('AutoPost running on port', PORT));
