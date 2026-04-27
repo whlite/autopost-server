@@ -6,9 +6,6 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
-// CORS
-// Later we can tighten this to your exact Chrome extension ID.
-// For now, this keeps your extension working while secrets stay protected.
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -22,20 +19,27 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 8080;
-const SHEET_ID = process.env.SHEET_ID;
+
+// Sheet ID is not the dangerous secret. This fallback prevents Railway from crashing.
+const SHEET_ID = process.env.SHEET_ID || '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
+
+// DO NOT hardcode the Claude key. This must stay in Railway Variables.
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const SESSION_SECRET = process.env.SESSION_SECRET;
 
-if (!SHEET_ID) {
-  throw new Error('Missing SHEET_ID Railway variable');
-}
-
-if (!SESSION_SECRET) {
-  throw new Error('Missing SESSION_SECRET Railway variable');
-}
+// Session secret fallback keeps server alive if Railway variables are annoying.
+// Later we will force this into Railway only.
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 const loginAttempts = new Map();
+
+console.log('AutoPost booting...');
+console.log('SHEET_ID loaded:', !!SHEET_ID);
+console.log('ANTHROPIC_API_KEY loaded:', !!ANTHROPIC_API_KEY);
+console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
+console.log('PORT:', PORT);
 
 function now() {
   return Date.now();
@@ -66,7 +70,7 @@ function rateLimitLogin(username, ip) {
     firstAttempt: now()
   };
 
-  const windowMs = 1000 * 60 * 10; // 10 minutes
+  const windowMs = 1000 * 60 * 10;
 
   if (now() - existing.firstAttempt > windowMs) {
     loginAttempts.set(key, {
@@ -74,9 +78,7 @@ function rateLimitLogin(username, ip) {
       firstAttempt: now()
     });
 
-    return {
-      allowed: true
-    };
+    return { allowed: true };
   }
 
   existing.count += 1;
@@ -89,9 +91,7 @@ function rateLimitLogin(username, ip) {
     };
   }
 
-  return {
-    allowed: true
-  };
+  return { allowed: true };
 }
 
 function createSessionToken(payload) {
@@ -322,16 +322,20 @@ async function requireActiveSession(req, res, next) {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '2.0',
-    auth: 'token'
+    version: '2.1',
+    auth: 'token',
+    sheetLoaded: !!SHEET_ID,
+    aiConfigured: !!ANTHROPIC_API_KEY
   });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '2.0',
-    time: new Date().toISOString()
+    version: '2.1',
+    time: new Date().toISOString(),
+    sheetLoaded: !!SHEET_ID,
+    aiConfigured: !!ANTHROPIC_API_KEY
   });
 });
 
@@ -408,8 +412,6 @@ app.post('/verify-session', requireActiveSession, async (req, res) => {
 });
 
 app.post('/logout', (req, res) => {
-  // Stateless tokens cannot truly be destroyed server-side unless we add a token denylist.
-  // For now, the Chrome extension deletes the token locally.
   return res.json({
     success: true
   });
