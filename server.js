@@ -20,19 +20,18 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 8080;
 
-// Sheet ID is not the dangerous secret. This fallback keeps the server alive.
+// Sheet ID is not the dangerous secret, but Railway should still hold it.
 const SHEET_ID = process.env.SHEET_ID || '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
 
-// Claude/Anthropic key stays protected in Railway Variables.
-// This checks multiple possible variable names.
+// Claude/Anthropic key stays protected inside Railway Variables.
+// Your working Railway variable is CLAUDE_API_KEY.
 const ANTHROPIC_API_KEY =
   process.env.ANTHROPIC_API_KEY ||
   process.env.CLAUDE_API_KEY ||
   process.env.ANTHROPIC_KEY ||
   process.env.CLAUDE_KEY;
 
-// Session secret fallback keeps server alive for now.
-// Later we can force this into Railway only.
+// Session secret should be stored in Railway Variables.
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
@@ -43,10 +42,6 @@ const loginAttempts = new Map();
 console.log('AutoPost booting...');
 console.log('SHEET_ID loaded:', !!SHEET_ID);
 console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
-console.log(
-  'AI env names found:',
-  Object.keys(process.env).filter((k) => k.includes('ANTHROPIC') || k.includes('CLAUDE'))
-);
 console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
 console.log('PORT:', PORT);
 
@@ -331,7 +326,7 @@ async function requireActiveSession(req, res, next) {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '2.3',
+    version: '2.4',
     auth: 'token',
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY
@@ -341,25 +336,10 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '2.3',
+    version: '2.4',
     time: new Date().toISOString(),
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY
-  });
-});
-
-// TEMPORARY DEBUG ROUTE
-// This does NOT show your key. It only shows whether Railway can see it.
-// We will delete this after the key works.
-app.get('/debug-env', (req, res) => {
-  res.json({
-    hasAnthropicApiKey: !!process.env.ANTHROPIC_API_KEY,
-    hasClaudeApiKey: !!process.env.CLAUDE_API_KEY,
-    hasAnthropicKey: !!process.env.ANTHROPIC_KEY,
-    hasClaudeKey: !!process.env.CLAUDE_KEY,
-    matchingEnvNames: Object.keys(process.env).filter((k) =>
-      k.includes('ANTHROPIC') || k.includes('CLAUDE')
-    )
   });
 });
 
