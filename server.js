@@ -23,11 +23,16 @@ const PORT = process.env.PORT || 8080;
 // Sheet ID is not the dangerous secret. This fallback prevents Railway from crashing.
 const SHEET_ID = process.env.SHEET_ID || '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
 
-// DO NOT hardcode the Claude key. This must stay in Railway Variables.
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+// Claude/Anthropic key stays protected in Railway Variables.
+// This checks multiple names because Railway is currently acting like a drunk raccoon.
+const ANTHROPIC_API_KEY =
+  process.env.ANTHROPIC_API_KEY ||
+  process.env.CLAUDE_API_KEY ||
+  process.env.ANTHROPIC_KEY ||
+  process.env.CLAUDE_KEY;
 
 // Session secret fallback keeps server alive if Railway variables are annoying.
-// Later we will force this into Railway only.
+// Later we can force this into Railway only.
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
@@ -37,7 +42,11 @@ const loginAttempts = new Map();
 
 console.log('AutoPost booting...');
 console.log('SHEET_ID loaded:', !!SHEET_ID);
-console.log('ANTHROPIC_API_KEY loaded:', !!ANTHROPIC_API_KEY);
+console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
+console.log(
+  'AI env names found:',
+  Object.keys(process.env).filter((k) => k.includes('ANTHROPIC') || k.includes('CLAUDE'))
+);
 console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
 console.log('PORT:', PORT);
 
@@ -322,7 +331,7 @@ async function requireActiveSession(req, res, next) {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '2.1',
+    version: '2.2',
     auth: 'token',
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY
@@ -332,7 +341,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '2.1',
+    version: '2.2',
     time: new Date().toISOString(),
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY
