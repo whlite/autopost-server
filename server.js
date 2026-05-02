@@ -1,6 +1,7 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 const { clerkMiddleware, getAuth } = require('@clerk/express');
 
 const app = express();
@@ -23,23 +24,30 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 8080;
 
-// Sheet ID is not the dangerous secret, but Railway should still hold it.
 const SHEET_ID = process.env.SHEET_ID || '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
 
-// Claude/Anthropic key stays protected inside Railway Variables.
-// Your working Railway variable is CLAUDE_API_KEY.
 const ANTHROPIC_API_KEY =
   process.env.ANTHROPIC_API_KEY ||
   process.env.CLAUDE_API_KEY ||
   process.env.ANTHROPIC_KEY ||
   process.env.CLAUDE_KEY;
 
-// Session secret should be stored in Railway Variables.
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
 
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false
+      }
+    })
+  : null;
+
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const loginAttempts = new Map();
 
 console.log('AutoPost booting...');
@@ -47,7 +55,34 @@ console.log('SHEET_ID loaded:', !!SHEET_ID);
 console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
 console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
 console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
+console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
+console.log('DATABASE_URL loaded:', !!DATABASE_URL);
 console.log('PORT:', PORT);
+
+async function initDb() {
+  if (!pool) {
+    console.log('Database not configured yet.');
+    return;
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS autopost_users (
+      id SERIAL PRIMARY KEY,
+      clerk_user_id TEXT UNIQUE,
+      email TEXT UNIQUE,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      subscription_status TEXT DEFAULT 'inactive',
+      current_period_end TIMESTAMPTZ,
+      extension_enabled BOOLEAN DEFAULT TRUE,
+      plan TEXT DEFAULT 'starter',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  console.log('Database ready: autopost_users table checked.');
+}
 
 function now() {
   return Date.now();
@@ -330,28 +365,27 @@ async function requireActiveSession(req, res, next) {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '2.5',
-    auth: 'token + clerk test',
+    version: '2.6',
+    auth: 'token + clerk + neon',
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY,
-    clerkLoaded: !!process.env.CLERK_SECRET_KEY
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
+    databaseLoaded: !!DATABASE_URL
   });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '2.5',
+    version: '2.6',
     time: new Date().toISOString(),
     sheetLoaded: !!SHEET_ID,
     aiConfigured: !!ANTHROPIC_API_KEY,
-    clerkLoaded: !!process.env.CLERK_SECRET_KEY
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
+    databaseLoaded: !!DATABASE_URL
   });
 });
 
-// Clerk test route.
-// This proves Clerk is installed and the server can read your Clerk secret key.
-// It will say isAuthenticated false until the website or extension sends a real Clerk session token.
 app.get('/api/clerk-test', (req, res) => {
   const auth = getAuth(req);
 
@@ -362,6 +396,94 @@ app.get('/api/clerk-test', (req, res) => {
     userId: auth.userId || null,
     sessionId: auth.sessionId || null
   });
+});
+
+app.get('/api/db-test', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(500).json({
+        success: false,
+        error: 'DATABASE_URL is missing'
+      });
+    }
+
+    const result = await pool.query('SELECT NOW() AS now');
+
+    return res.json({
+      success: true,
+      databaseConnected: true,
+      time: result.rows[0].now
+    });
+  } catch (e) {
+    console.error('DB test error:', e.message);
+
+    return res.status(500).json({
+      success: false,
+      databaseConnected: false,
+      error: e.message
+    });
+  }
+});
+
+app.get('/api/extension/access', async (req, res) => {
+  try {
+    const auth = getAuth(req);
+
+    if (!auth.isAuthenticated || !auth.userId) {
+      return res.status(401).json({
+        allowed: false,
+        status: 'unauthenticated',
+        error: 'Please sign in.'
+      });
+    }
+
+    if (!pool) {
+      return res.status(500).json({
+        allowed: false,
+        status: 'database_missing',
+        error: 'Database is not configured.'
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT *
+       FROM autopost_users
+       WHERE clerk_user_id = $1
+       LIMIT 1`,
+      [auth.userId]
+    );
+
+    const user = result.rows[0];
+
+    if (!user) {
+      return res.status(403).json({
+        allowed: false,
+        status: 'no_subscription',
+        error: 'No subscription found.'
+      });
+    }
+
+    const status = String(user.subscription_status || 'inactive').toLowerCase();
+
+    const active =
+      user.extension_enabled !== false &&
+      (status === 'active' || status === 'trialing');
+
+    return res.json({
+      allowed: active,
+      status,
+      plan: user.plan || 'starter',
+      currentPeriodEnd: user.current_period_end || null
+    });
+  } catch (e) {
+    console.error('Extension access error:', e.message);
+
+    return res.status(500).json({
+      allowed: false,
+      status: 'server_error',
+      error: 'Server error'
+    });
+  }
 });
 
 app.post('/login', async (req, res) => {
@@ -541,6 +663,13 @@ app.use((req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`AutoPost running on port ${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`AutoPost running on port ${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error('Database startup error:', e.message);
+    process.exit(1);
+  });
