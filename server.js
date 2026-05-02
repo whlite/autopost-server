@@ -1,8 +1,11 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const { clerkMiddleware, getAuth } = require('@clerk/express');
 
 const app = express();
+
+app.use(clerkMiddleware());
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -43,6 +46,7 @@ console.log('AutoPost booting...');
 console.log('SHEET_ID loaded:', !!SHEET_ID);
 console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
 console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
+console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
 console.log('PORT:', PORT);
 
 function now() {
@@ -326,20 +330,37 @@ async function requireActiveSession(req, res, next) {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '2.4',
-    auth: 'token',
+    version: '2.5',
+    auth: 'token + clerk test',
     sheetLoaded: !!SHEET_ID,
-    aiConfigured: !!ANTHROPIC_API_KEY
+    aiConfigured: !!ANTHROPIC_API_KEY,
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY
   });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '2.4',
+    version: '2.5',
     time: new Date().toISOString(),
     sheetLoaded: !!SHEET_ID,
-    aiConfigured: !!ANTHROPIC_API_KEY
+    aiConfigured: !!ANTHROPIC_API_KEY,
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY
+  });
+});
+
+// Clerk test route.
+// This proves Clerk is installed and the server can read your Clerk secret key.
+// It will say isAuthenticated false until the website or extension sends a real Clerk session token.
+app.get('/api/clerk-test', (req, res) => {
+  const auth = getAuth(req);
+
+  return res.json({
+    success: true,
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
+    isAuthenticated: !!auth.isAuthenticated,
+    userId: auth.userId || null,
+    sessionId: auth.sessionId || null
   });
 });
 
