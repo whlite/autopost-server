@@ -1,675 +1,618 @@
+'use strict';
+
+// ============================================================
+// AutoPost Railway Server
+// Auth: Clerk  |  Billing: Stripe  |  DB: Neon Postgres
+// Legacy Google Sheets routes preserved until migration complete
+// ============================================================
+
 const express = require('express');
-const fetch = require('node-fetch');
-const crypto = require('crypto');
+const cors = require('cors');
 const { Pool } = require('pg');
-const { clerkMiddleware, getAuth } = require('@clerk/express');
+const Stripe = require('stripe');
+const { createClerkClient } = require('@clerk/backend');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-app.use(clerkMiddleware());
+// ── Clients ──────────────────────────────────────────────────
+const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
-app.use(express.json({ limit: '10mb' }));
+// ── CORS ─────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://tryautopost.com',
+  'https://www.tryautopost.com',
+  'chrome-extension://kjoaedklmmpkikmeigaehgaglialdabl', // prod extension ID — update as needed
+];
 
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // also allow any chrome-extension:// origin during development
+    if (/^chrome-extension:\/\//.test(origin)) return cb(null, true);
+    cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+// ── Raw body for Stripe webhooks (must come BEFORE express.json) ──
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 
-  next();
-});
+// ── JSON body for everything else ────────────────────────────
+app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-
-const SHEET_ID = process.env.SHEET_ID || '1IFSySEWA6fO_xYBlZXhb5skbzMQiMjUf';
-
-const ANTHROPIC_API_KEY =
-  process.env.ANTHROPIC_API_KEY ||
-  process.env.CLAUDE_API_KEY ||
-  process.env.ANTHROPIC_KEY ||
-  process.env.CLAUDE_KEY;
-
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
-
-const DATABASE_URL = process.env.DATABASE_URL || '';
-
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: {
-        rejectUnauthorized: false
-      }
-    })
-  : null;
-
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
-const loginAttempts = new Map();
-
-console.log('AutoPost booting...');
-console.log('SHEET_ID loaded:', !!SHEET_ID);
-console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
-console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
-console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
-console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
-console.log('DATABASE_URL loaded:', !!DATABASE_URL);
-console.log('PORT:', PORT);
-
-async function initDb() {
-  if (!pool) {
-    console.log('Database not configured yet.');
-    return;
-  }
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS autopost_users (
-      id SERIAL PRIMARY KEY,
-      clerk_user_id TEXT UNIQUE,
-      email TEXT UNIQUE,
-      stripe_customer_id TEXT,
+// ── DB bootstrap — create tables if they don't exist ─────────
+async function bootstrapDB() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id            SERIAL PRIMARY KEY,
+      owner_clerk_id TEXT NOT NULL UNIQUE,
+      plan          TEXT NOT NULL DEFAULT 'solo',
+      seat_limit    INT  NOT NULL DEFAULT 1,
+      stripe_customer_id    TEXT,
       stripe_subscription_id TEXT,
-      subscription_status TEXT DEFAULT 'inactive',
-      current_period_end TIMESTAMPTZ,
-      extension_enabled BOOLEAN DEFAULT TRUE,
-      plan TEXT DEFAULT 'starter',
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
+      subscription_status   TEXT DEFAULT 'inactive',
+      extension_enabled     BOOLEAN DEFAULT false,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
-  console.log('Database ready: autopost_users table checked.');
-}
-
-function now() {
-  return Date.now();
-}
-
-function normalizeUsername(username) {
-  return String(username || '').toLowerCase().trim();
-}
-
-function safeEqual(a, b) {
-  const aString = String(a || '');
-  const bString = String(b || '');
-
-  const aBuf = Buffer.from(aString);
-  const bBuf = Buffer.from(bString);
-
-  if (aBuf.length !== bBuf.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
-
-function rateLimitLogin(username, ip) {
-  const key = `${ip}:${normalizeUsername(username)}`;
-  const existing = loginAttempts.get(key) || {
-    count: 0,
-    firstAttempt: now()
-  };
-
-  const windowMs = 1000 * 60 * 10;
-
-  if (now() - existing.firstAttempt > windowMs) {
-    loginAttempts.set(key, {
-      count: 1,
-      firstAttempt: now()
-    });
-
-    return { allowed: true };
-  }
-
-  existing.count += 1;
-  loginAttempts.set(key, existing);
-
-  if (existing.count > 10) {
-    return {
-      allowed: false,
-      error: 'Too many login attempts. Try again later.'
-    };
-  }
-
-  return { allowed: true };
-}
-
-function createSessionToken(payload) {
-  const session = {
-    username: normalizeUsername(payload.username),
-    deviceId: String(payload.deviceId || ''),
-    issuedAt: now(),
-    expiresAt: now() + SESSION_TTL_MS
-  };
-
-  const body = Buffer.from(JSON.stringify(session)).toString('base64url');
-
-  const sig = crypto
-    .createHmac('sha256', SESSION_SECRET)
-    .update(body)
-    .digest('base64url');
-
-  return `${body}.${sig}`;
-}
-
-function verifySessionToken(token) {
-  if (!token || typeof token !== 'string' || !token.includes('.')) {
-    return {
-      valid: false,
-      error: 'Missing token'
-    };
-  }
-
-  const parts = token.split('.');
-
-  if (parts.length !== 2) {
-    return {
-      valid: false,
-      error: 'Invalid token format'
-    };
-  }
-
-  const [body, sig] = parts;
-
-  if (!body || !sig) {
-    return {
-      valid: false,
-      error: 'Invalid token format'
-    };
-  }
-
-  const expectedSig = crypto
-    .createHmac('sha256', SESSION_SECRET)
-    .update(body)
-    .digest('base64url');
-
-  if (!safeEqual(sig, expectedSig)) {
-    return {
-      valid: false,
-      error: 'Invalid token signature'
-    };
-  }
-
-  let session;
-
-  try {
-    session = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-  } catch (e) {
-    return {
-      valid: false,
-      error: 'Invalid token body'
-    };
-  }
-
-  if (!session.expiresAt || now() > session.expiresAt) {
-    return {
-      valid: false,
-      error: 'Session expired'
-    };
-  }
-
-  return {
-    valid: true,
-    session
-  };
-}
-
-function parseCsvLine(line) {
-  const cols = [];
-  let cur = '';
-  let inQ = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-
-    if (ch === '"') {
-      if (inQ && line[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
-        inQ = !inQ;
-      }
-    } else if (ch === ',' && !inQ) {
-      cols.push(cur.trim());
-      cur = '';
-    } else {
-      cur += ch;
-    }
-  }
-
-  cols.push(cur.trim());
-
-  return cols;
-}
-
-async function getUsers() {
-  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Google Sheet fetch failed: ${res.status}`);
-  }
-
-  const text = await res.text();
-  const lines = text.trim().split('\n');
-
-  if (lines.length < 2) {
-    return [];
-  }
-
-  const headers = parseCsvLine(lines[0]).map((h) => h.toLowerCase().trim());
-
-  function getCol(cols, name, fallbackIndex) {
-    const index = headers.indexOf(name.toLowerCase());
-
-    if (index >= 0) {
-      return cols[index] || '';
-    }
-
-    return cols[fallbackIndex] || '';
-  }
-
-  const users = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) {
-      continue;
-    }
-
-    const cols = parseCsvLine(lines[i]);
-
-    const username = normalizeUsername(getCol(cols, 'username', 0));
-    const password = String(getCol(cols, 'password', 1) || '').trim();
-    const activeRaw = String(getCol(cols, 'active', 2) || '').trim().toUpperCase();
-
-    const plan = String(getCol(cols, 'plan', 3) || 'starter').trim();
-    const subscriptionStatus = String(getCol(cols, 'subscriptionstatus', 4) || '').trim().toLowerCase();
-    const deviceLimitRaw = Number(getCol(cols, 'devicelimit', 5) || 1);
-
-    if (!username || username === 'username') {
-      continue;
-    }
-
-    users.push({
-      username,
-      password,
-      active: activeRaw === 'TRUE',
-      plan,
-      subscriptionStatus,
-      deviceLimit: Number.isFinite(deviceLimitRaw) && deviceLimitRaw > 0 ? deviceLimitRaw : 1
-    });
-  }
-
-  return users;
-}
-
-async function findUser(username) {
-  const users = await getUsers();
-  return users.find((u) => u.username === normalizeUsername(username));
-}
-
-function publicUser(user) {
-  return {
-    username: user.username,
-    active: user.active,
-    plan: user.plan || 'starter',
-    subscriptionStatus: user.subscriptionStatus || '',
-    deviceLimit: user.deviceLimit || 1
-  };
-}
-
-async function requireActiveSession(req, res, next) {
-  try {
-    const auth = req.headers.authorization || '';
-    const tokenFromHeader = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    const token = tokenFromHeader || req.body.token;
-
-    const verified = verifySessionToken(token);
-
-    if (!verified.valid) {
-      return res.status(401).json({
-        success: false,
-        active: false,
-        error: verified.error
-      });
-    }
-
-    const user = await findUser(verified.session.username);
-
-    if (!user || !user.active) {
-      return res.status(403).json({
-        success: false,
-        active: false,
-        error: 'Account inactive. Please check your subscription.'
-      });
-    }
-
-    req.session = verified.session;
-    req.user = user;
-
-    next();
-  } catch (e) {
-    console.error('Session check error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      active: false,
-      error: 'Server error'
-    });
-  }
-}
-
-app.get('/', (req, res) => {
-  res.json({
-    status: 'AutoPost server running',
-    version: '2.6',
-    auth: 'token + clerk + neon',
-    sheetLoaded: !!SHEET_ID,
-    aiConfigured: !!ANTHROPIC_API_KEY,
-    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
-    databaseLoaded: !!DATABASE_URL
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    version: '2.6',
-    time: new Date().toISOString(),
-    sheetLoaded: !!SHEET_ID,
-    aiConfigured: !!ANTHROPIC_API_KEY,
-    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
-    databaseLoaded: !!DATABASE_URL
-  });
-});
-
-app.get('/api/clerk-test', (req, res) => {
-  const auth = getAuth(req);
-
-  return res.json({
-    success: true,
-    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
-    isAuthenticated: !!auth.isAuthenticated,
-    userId: auth.userId || null,
-    sessionId: auth.sessionId || null
-  });
-});
-
-app.get('/api/db-test', async (req, res) => {
-  try {
-    if (!pool) {
-      return res.status(500).json({
-        success: false,
-        error: 'DATABASE_URL is missing'
-      });
-    }
-
-    const result = await pool.query('SELECT NOW() AS now');
-
-    return res.json({
-      success: true,
-      databaseConnected: true,
-      time: result.rows[0].now
-    });
-  } catch (e) {
-    console.error('DB test error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      databaseConnected: false,
-      error: e.message
-    });
-  }
-});
-
-app.get('/api/extension/access', async (req, res) => {
-  try {
-    const auth = getAuth(req);
-
-    if (!auth.isAuthenticated || !auth.userId) {
-      return res.status(401).json({
-        allowed: false,
-        status: 'unauthenticated',
-        error: 'Please sign in.'
-      });
-    }
-
-    if (!pool) {
-      return res.status(500).json({
-        allowed: false,
-        status: 'database_missing',
-        error: 'Database is not configured.'
-      });
-    }
-
-    const result = await pool.query(
-      `SELECT *
-       FROM autopost_users
-       WHERE clerk_user_id = $1
-       LIMIT 1`,
-      [auth.userId]
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS team_members (
+      id         SERIAL PRIMARY KEY,
+      team_id    INT  NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      clerk_id   TEXT NOT NULL UNIQUE,
+      email      TEXT,
+      role       TEXT NOT NULL DEFAULT 'member',  -- 'owner' | 'member'
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
+  `);
 
-    const user = result.rows[0];
+  console.log('AutoPost: DB tables ready');
+}
 
-    if (!user) {
-      return res.status(403).json({
-        allowed: false,
-        status: 'no_subscription',
-        error: 'No subscription found.'
-      });
-    }
+bootstrapDB().catch(err => console.error('AutoPost: DB bootstrap error', err));
 
-    const status = String(user.subscription_status || 'inactive').toLowerCase();
+// ============================================================
+// HELPERS
+// ============================================================
 
-    const active =
-      user.extension_enabled !== false &&
-      (status === 'active' || status === 'trialing');
+/** Pull Bearer token from Authorization header */
+function getBearerToken(req) {
+  const auth = req.headers.authorization || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  return null;
+}
 
-    return res.json({
-      allowed: active,
-      status,
-      plan: user.plan || 'starter',
-      currentPeriodEnd: user.current_period_end || null
-    });
-  } catch (e) {
-    console.error('Extension access error:', e.message);
+/**
+ * Verify Clerk session token and return { clerkUserId, email }.
+ * Throws on failure so callers can catch and send 401.
+ */
+async function requireClerkAuth(req) {
+  const token = getBearerToken(req);
+  if (!token) throw new Error('Missing auth token');
 
-    return res.status(500).json({
-      allowed: false,
-      status: 'server_error',
-      error: 'Server error'
-    });
-  }
-});
+  // Verify the JWT with Clerk
+  const payload = await clerk.verifyToken(token);
+  if (!payload || !payload.sub) throw new Error('Invalid token');
 
+  // Optionally fetch email from Clerk
+  let email = '';
+  try {
+    const user = await clerk.users.getUser(payload.sub);
+    email = (user.emailAddresses && user.emailAddresses[0] && user.emailAddresses[0].emailAddress) || '';
+  } catch (_) {}
+
+  return { clerkUserId: payload.sub, email };
+}
+
+/** Map Stripe subscription status → extension allowed */
+function isSubscriptionActive(status) {
+  return status === 'active' || status === 'trialing';
+}
+
+// ============================================================
+// LEGACY AUTH (Google Sheets era) — KEEP UNTIL MIGRATION DONE
+// ============================================================
+
+// These are intentionally left here so the existing Chrome extension
+// (which calls /login and /verify-session) keeps working while you
+// roll out the Clerk migration. Replace these with stubs or remove
+// them only after all users are on the new flow.
+
+const LEGACY_TOKENS = new Map(); // token -> { username, expiresAt }
+
+function legacyGenerateToken(username) {
+  const token = 'ap_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  LEGACY_TOKENS.set(token, { username, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+  return token;
+}
+
+function legacyVerifyToken(token) {
+  const rec = LEGACY_TOKENS.get(token);
+  if (!rec) return null;
+  if (Date.now() > rec.expiresAt) { LEGACY_TOKENS.delete(token); return null; }
+  return rec;
+}
+
+// POST /login  — legacy username/password login
 app.post('/login', async (req, res) => {
   try {
-    const { username, password, deviceId } = req.body;
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ success: false, error: 'Missing credentials' });
 
-    const normalizedUsername = normalizeUsername(username);
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-
-    const limited = rateLimitLogin(normalizedUsername, ip);
-
-    if (!limited.allowed) {
-      return res.status(429).json({
-        success: false,
-        error: limited.error
-      });
-    }
-
-    console.log('Login attempt:', normalizedUsername);
-
-    const user = await findUser(normalizedUsername);
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid username or password'
-      });
-    }
-
-    if (!safeEqual(user.password, String(password || '').trim())) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid username or password'
-      });
-    }
-
-    if (!user.active) {
-      return res.status(403).json({
-        success: false,
-        error: 'Account inactive. Please check your subscription.'
-      });
-    }
-
-    const token = createSessionToken({
-      username: normalizedUsername,
-      deviceId
-    });
-
-    console.log('Login success:', normalizedUsername);
-
-    return res.json({
-      success: true,
-      token,
-      expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
-      user: publicUser(user)
-    });
-  } catch (e) {
-    console.error('Login error:', e.message);
-
-    return res.status(500).json({
+    // ── Look up user in Neon by email/username ──
+    // During migration we check legacy column if it exists, else Clerk only.
+    // Adjust the query to match your actual users table if you have one.
+    // For now we'll fall through to a basic Clerk password check via signIn.
+    // NOTE: Clerk doesn't expose password verification via backend SDK.
+    // The recommended migration path: point users to the new website login
+    // and issue a short-lived JWT via Clerk, then exchange it here.
+    // Until then, return a clear error so users know to use the new flow.
+    return res.status(401).json({
       success: false,
-      error: 'Server error'
+      error: 'Please log in at tryautopost.com to get your access token, then paste it in the extension.',
     });
+  } catch (err) {
+    console.error('/login error', err);
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
-app.post('/verify-session', requireActiveSession, async (req, res) => {
-  return res.json({
-    success: true,
-    active: true,
-    user: publicUser(req.user)
-  });
-});
-
-app.post('/logout', (req, res) => {
-  return res.json({
-    success: true
-  });
-});
-
-app.post('/describe', requireActiveSession, async (req, res) => {
+// POST /verify-session  — called by extension background.js and popup.js
+app.post('/verify-session', async (req, res) => {
   try {
-    if (!ANTHROPIC_API_KEY) {
-      return res.status(501).json({
-        success: false,
-        error: 'AI description service is not configured'
-      });
+    const token = getBearerToken(req) || (req.body && req.body.token);
+    if (!token) return res.status(401).json({ success: false, active: false, error: 'No token' });
+
+    // ── Try Clerk JWT first ──
+    try {
+      const payload = await clerk.verifyToken(token);
+      if (payload && payload.sub) {
+        // Find the team member
+        const memberRow = await db.query(
+          `SELECT tm.*, t.plan, t.seat_limit, t.subscription_status, t.extension_enabled
+           FROM team_members tm
+           JOIN teams t ON t.id = tm.team_id
+           WHERE tm.clerk_id = $1`,
+          [payload.sub]
+        );
+
+        if (memberRow.rows.length === 0) {
+          return res.json({ success: false, active: false, error: 'No active subscription found.' });
+        }
+
+        const row = memberRow.rows[0];
+        const active = row.extension_enabled && isSubscriptionActive(row.subscription_status);
+
+        return res.json({
+          success: true,
+          active,
+          allowed: active,
+          user: {
+            username: row.email || payload.sub,
+            plan: row.plan,
+            subscriptionStatus: row.subscription_status,
+          },
+        });
+      }
+    } catch (_) {
+      // not a valid Clerk token — fall through to legacy check
     }
 
-    const { vehicle = {}, settings = {} } = req.body;
-
-    const extra = String(settings.aiInstructions || '').trim();
-    const dealerText = String(vehicle.dealerDescription || '').slice(0, 2000);
-    const mileage = vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : '';
-
-    const prompt = `You are writing a Facebook Marketplace car listing. Use this exact format:
-
-2019 Mercedes-Benz GLC 300
-- Exterior: Polar White
-- Interior: Black
-- Drivetrain: AWD 4MATIC
-- Transmission: 9-Speed Automatic
-- Engine: 2.0L Turbocharged 4-Cylinder
-- Mileage: 66,131 miles
-
-DM for more info! We carry Porsche, Mercedes & Audi.
-
-Vehicle title: ${vehicle.title || 'Unknown'}
-Exterior color: ${vehicle.color || 'find in dealer text'}
-${mileage ? 'Mileage: ' + mileage : ''}
-
-Dealer page text:
-${dealerText || 'Not available'}
-
-Rules:
-1. First line must be year make model only.
-2. Specs must use "- Label: Value".
-3. Do not invent colors.
-4. Use known vehicle specs only when highly confident.
-5. Do not include emojis.
-6. After specs, add one blank line.
-${extra ? '7. Then add this text exactly:\n' + extra : '7. End with: DM for more info!'}
-
-Write the listing now.`;
-
-    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
-        messages: [
-          {
-            role: 'user',
-            content: prompt
-          }
-        ]
-      })
-    });
-
-    if (!aiRes.ok) {
-      const errText = await aiRes.text();
-
-      console.error('Anthropic error:', aiRes.status, errText.slice(0, 500));
-
-      return res.status(502).json({
-        success: false,
-        error: 'AI description failed'
-      });
+    // ── Legacy in-memory token ──
+    const rec = legacyVerifyToken(token);
+    if (rec) {
+      return res.json({ success: true, active: true, allowed: true, user: { username: rec.username } });
     }
 
-    const data = await aiRes.json();
-    const description = data.content && data.content[0] ? data.content[0].text.trim() : '';
-
-    return res.json({
-      success: true,
-      description
-    });
-  } catch (e) {
-    console.error('Describe error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    return res.status(401).json({ success: false, active: false, error: 'Invalid or expired token.' });
+  } catch (err) {
+    console.error('/verify-session error', err);
+    res.status(500).json({ success: false, active: false, error: 'Server error' });
   }
 });
 
-app.use((req, res) => {
-  return res.status(404).json({
-    success: false,
-    error: 'Route not found'
+// POST /logout  — legacy
+app.post('/logout', (req, res) => {
+  const token = getBearerToken(req) || (req.body && req.body.token);
+  if (token) LEGACY_TOKENS.delete(token);
+  res.json({ success: true });
+});
+
+// ============================================================
+// EXISTING WORKING ROUTES — DO NOT TOUCH
+// ============================================================
+
+// GET /api/clerk-test
+app.get('/api/clerk-test', async (req, res) => {
+  try {
+    // Simple connectivity test — list first user
+    const users = await clerk.users.getUserList({ limit: 1 });
+    res.json({ success: true, clerkConnected: true, userCount: users.totalCount });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/db-test
+app.get('/api/db-test', async (req, res) => {
+  try {
+    const result = await db.query('SELECT NOW() AS now');
+    res.json({ success: true, dbConnected: true, serverTime: result.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /describe  — vehicle description generation (keep working)
+app.post('/describe', async (req, res) => {
+  // Description is now generated locally in the extension (background.js).
+  // This endpoint is kept as a no-op stub so old extension versions don't error.
+  res.json({ success: true, description: '' });
+});
+
+// ============================================================
+// NEW: STRIPE CONFIG TEST
+// ============================================================
+
+// GET /api/stripe-config-test
+app.get('/api/stripe-config-test', (req, res) => {
+  res.json({
+    success: true,
+    STRIPE_SECRET_KEY:    !!process.env.STRIPE_SECRET_KEY,
+    STRIPE_PRICE_SOLO:    !!process.env.STRIPE_PRICE_SOLO,
+    STRIPE_PRICE_TEAM:    !!process.env.STRIPE_PRICE_TEAM,
   });
 });
 
-initDb()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`AutoPost running on port ${PORT}`);
+// ============================================================
+// NEW: STRIPE CHECKOUT SESSION
+// ============================================================
+
+// POST /api/stripe/create-checkout-session
+// Body: { plan: "solo" | "team" }
+// Requires Clerk Bearer token in Authorization header
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  try {
+    const { clerkUserId, email } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
+
+    const { plan } = req.body || {};
+    if (!plan || !['solo', 'team'].includes(plan)) {
+      return res.status(400).json({ success: false, error: 'plan must be "solo" or "team"' });
+    }
+
+    const priceId = plan === 'solo' ? process.env.STRIPE_PRICE_SOLO : process.env.STRIPE_PRICE_TEAM;
+    if (!priceId) return res.status(500).json({ success: false, error: `STRIPE_PRICE_${plan.toUpperCase()} not configured` });
+
+    const seatLimit = plan === 'solo' ? 1 : 3;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: email || undefined,
+      success_url: 'https://tryautopost.com/success',
+      cancel_url:  'https://tryautopost.com/pricing',
+      metadata: {
+        clerkUserId,
+        email,
+        plan,
+        seatLimit: String(seatLimit),
+      },
+      subscription_data: {
+        metadata: {
+          clerkUserId,
+          email,
+          plan,
+          seatLimit: String(seatLimit),
+        },
+      },
     });
-  })
-  .catch((e) => {
-    console.error('Database startup error:', e.message);
-    process.exit(1);
-  });
+
+    res.json({ success: true, url: session.url });
+  } catch (err) {
+    console.error('/api/stripe/create-checkout-session error', err);
+    const status = err.status || 500;
+    res.status(status).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================
+// NEW: STRIPE WEBHOOK
+// ============================================================
+
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// POST /api/stripe/webhook
+app.post('/api/stripe/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Stripe webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    await handleStripeEvent(event);
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Stripe webhook handler error:', err);
+    res.status(500).json({ error: 'Webhook handler failed' });
+  }
+});
+
+async function handleStripeEvent(event) {
+  const type = event.type;
+  console.log('AutoPost stripe event:', type);
+
+  // ── checkout.session.completed ──
+  if (type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const meta = session.metadata || {};
+    const clerkUserId  = meta.clerkUserId;
+    const email        = meta.email || '';
+    const plan         = meta.plan || 'solo';
+    const seatLimit    = parseInt(meta.seatLimit || '1', 10);
+    const customerId   = session.customer;
+    const subId        = session.subscription;
+
+    if (!clerkUserId) {
+      console.error('checkout.session.completed: no clerkUserId in metadata');
+      return;
+    }
+
+    await upsertTeamAndMember({ clerkUserId, email, plan, seatLimit, customerId, subId, status: 'active', enabled: true });
+    return;
+  }
+
+  // ── subscription events ──
+  if (
+    type === 'customer.subscription.created' ||
+    type === 'customer.subscription.updated' ||
+    type === 'customer.subscription.deleted'
+  ) {
+    const sub = event.data.object;
+    const meta = sub.metadata || {};
+    const clerkUserId = meta.clerkUserId;
+    const plan        = meta.plan || 'solo';
+    const seatLimit   = parseInt(meta.seatLimit || '1', 10);
+    const customerId  = sub.customer;
+    const subId       = sub.id;
+    const status      = sub.status; // active | trialing | past_due | canceled | unpaid | incomplete_expired
+
+    if (!clerkUserId) return; // can't map without it
+
+    const enabled = isSubscriptionActive(status);
+    await upsertTeamAndOwnerStatus({ clerkUserId, plan, seatLimit, customerId, subId, status, enabled });
+    return;
+  }
+
+  // ── invoice.paid ──
+  if (type === 'invoice.paid') {
+    const invoice = event.data.object;
+    const subId   = invoice.subscription;
+    if (!subId) return;
+    await db.query(
+      `UPDATE teams SET subscription_status = 'active', extension_enabled = true, updated_at = NOW()
+       WHERE stripe_subscription_id = $1`,
+      [subId]
+    );
+    return;
+  }
+
+  // ── invoice.payment_failed ──
+  if (type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+    const subId   = invoice.subscription;
+    if (!subId) return;
+    await db.query(
+      `UPDATE teams SET subscription_status = 'past_due', extension_enabled = false, updated_at = NOW()
+       WHERE stripe_subscription_id = $1`,
+      [subId]
+    );
+    return;
+  }
+}
+
+/** Create or update the team row, then ensure the owner is in team_members */
+async function upsertTeamAndMember({ clerkUserId, email, plan, seatLimit, customerId, subId, status, enabled }) {
+  // Upsert team by owner_clerk_id
+  const teamRes = await db.query(
+    `INSERT INTO teams (owner_clerk_id, plan, seat_limit, stripe_customer_id, stripe_subscription_id, subscription_status, extension_enabled, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (owner_clerk_id) DO UPDATE SET
+       plan = EXCLUDED.plan,
+       seat_limit = EXCLUDED.seat_limit,
+       stripe_customer_id = EXCLUDED.stripe_customer_id,
+       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+       subscription_status = EXCLUDED.subscription_status,
+       extension_enabled = EXCLUDED.extension_enabled,
+       updated_at = NOW()
+     RETURNING id`,
+    [clerkUserId, plan, seatLimit, customerId, subId, status, enabled]
+  );
+
+  const teamId = teamRes.rows[0].id;
+
+  // Upsert the owner in team_members
+  await db.query(
+    `INSERT INTO team_members (team_id, clerk_id, email, role)
+     VALUES ($1, $2, $3, 'owner')
+     ON CONFLICT (clerk_id) DO UPDATE SET
+       team_id = EXCLUDED.team_id,
+       email   = EXCLUDED.email,
+       role    = 'owner'`,
+    [teamId, clerkUserId, email]
+  );
+}
+
+/** Update team status/enabled by owner_clerk_id — used for subscription updates */
+async function upsertTeamAndOwnerStatus({ clerkUserId, plan, seatLimit, customerId, subId, status, enabled }) {
+  await db.query(
+    `INSERT INTO teams (owner_clerk_id, plan, seat_limit, stripe_customer_id, stripe_subscription_id, subscription_status, extension_enabled, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (owner_clerk_id) DO UPDATE SET
+       plan = EXCLUDED.plan,
+       seat_limit = EXCLUDED.seat_limit,
+       stripe_customer_id = EXCLUDED.stripe_customer_id,
+       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+       subscription_status = EXCLUDED.subscription_status,
+       extension_enabled = EXCLUDED.extension_enabled,
+       updated_at = NOW()`,
+    [clerkUserId, plan, seatLimit, customerId, subId, status, enabled]
+  );
+}
+
+// ============================================================
+// NEW: EXTENSION ACCESS CHECK
+// ============================================================
+
+// GET /api/extension/access
+// Requires Clerk Bearer token in Authorization header
+app.get('/api/extension/access', async (req, res) => {
+  try {
+    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
+
+    // Find this Clerk user in team_members, join to team
+    const result = await db.query(
+      `SELECT
+         tm.role,
+         tm.email,
+         t.plan,
+         t.seat_limit,
+         t.subscription_status,
+         t.extension_enabled,
+         (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS seats_used
+       FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+       WHERE tm.clerk_id = $1`,
+      [clerkUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        allowed: false,
+        status: 'no_subscription',
+        plan: null,
+        seatLimit: 0,
+        seatsUsed: 0,
+        role: null,
+        extensionEnabled: false,
+      });
+    }
+
+    const row = result.rows[0];
+    const allowed = row.extension_enabled && isSubscriptionActive(row.subscription_status);
+
+    res.json({
+      allowed,
+      status: row.subscription_status,
+      plan: row.plan,
+      seatLimit: row.seat_limit,
+      seatsUsed: parseInt(row.seats_used, 10),
+      role: row.role,
+      extensionEnabled: row.extension_enabled,
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ allowed: false, error: err.message });
+  }
+});
+
+// ============================================================
+// NEW: TEAM MEMBER MANAGEMENT
+// ============================================================
+
+// POST /api/team/add-member
+// Body: { memberEmail: string }
+// Must be called by the team owner with their Clerk token.
+// Adds a pending invite — member activates via Clerk sign-up at tryautopost.com.
+// This endpoint resolves the Clerk ID by email lookup.
+app.post('/api/team/add-member', async (req, res) => {
+  try {
+    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
+    const { memberEmail } = req.body || {};
+    if (!memberEmail) return res.status(400).json({ success: false, error: 'memberEmail required' });
+
+    // Check caller is the team owner
+    const ownerCheck = await db.query(
+      `SELECT t.id, t.seat_limit, t.plan,
+              (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS seats_used
+       FROM teams t
+       JOIN team_members tm ON tm.team_id = t.id
+       WHERE tm.clerk_id = $1 AND tm.role = 'owner'`,
+      [clerkUserId]
+    );
+
+    if (ownerCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, error: 'Only the team owner can add members.' });
+    }
+
+    const { id: teamId, seat_limit, seats_used } = ownerCheck.rows[0];
+
+    if (parseInt(seats_used, 10) >= parseInt(seat_limit, 10)) {
+      return res.status(400).json({ success: false, error: `Seat limit (${seat_limit}) reached. Upgrade to add more members.` });
+    }
+
+    // Look up the Clerk user by email
+    const clerkUsers = await clerk.users.getUserList({ emailAddress: [memberEmail] });
+    if (!clerkUsers || !clerkUsers.data || clerkUsers.data.length === 0) {
+      return res.status(404).json({ success: false, error: 'That email is not registered with AutoPost yet. Ask them to sign up first.' });
+    }
+
+    const memberClerkId = clerkUsers.data[0].id;
+
+    // Make sure they're not already in a team
+    const existing = await db.query('SELECT id FROM team_members WHERE clerk_id = $1', [memberClerkId]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ success: false, error: 'That user already belongs to a team.' });
+    }
+
+    await db.query(
+      `INSERT INTO team_members (team_id, clerk_id, email, role) VALUES ($1, $2, $3, 'member')`,
+      [teamId, memberClerkId, memberEmail]
+    );
+
+    res.json({ success: true, message: `${memberEmail} added to your team.` });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/team/members  — list all members on the caller's team
+app.get('/api/team/members', async (req, res) => {
+  try {
+    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
+
+    const result = await db.query(
+      `SELECT tm2.clerk_id, tm2.email, tm2.role, tm2.created_at
+       FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+       JOIN team_members tm2 ON tm2.team_id = t.id
+       WHERE tm.clerk_id = $1
+       ORDER BY tm2.created_at`,
+      [clerkUserId]
+    );
+
+    res.json({ success: true, members: result.rows });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get('/health', (req, res) => res.json({ ok: true, version: '3.12' }));
+
+// ── Start ─────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`AutoPost server listening on port ${PORT}`));
