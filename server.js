@@ -72,7 +72,6 @@ async function bootstrapDB() {
     );
   `);
 
-  // Users table — email/password login for the extension
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id            SERIAL PRIMARY KEY,
@@ -83,7 +82,6 @@ async function bootstrapDB() {
     );
   `);
 
-  // Active tokens table — tokens survive server restarts
   await db.query(`
     CREATE TABLE IF NOT EXISTS active_tokens (
       token      TEXT PRIMARY KEY,
@@ -133,8 +131,6 @@ function generateToken() {
 // EMAIL + PASSWORD AUTH (extension login)
 // ============================================================
 
-// POST /login
-// Called by the extension popup with { username: email, password }
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body || {};
@@ -144,7 +140,6 @@ app.post('/login', async (req, res) => {
 
     const email = username.toLowerCase().trim();
 
-    // Find user by email
     const userRes = await db.query(
       `SELECT u.id, u.email, u.password_hash, u.team_id,
               t.plan, t.subscription_status, t.extension_enabled
@@ -160,18 +155,15 @@ app.post('/login', async (req, res) => {
 
     const user = userRes.rows[0];
 
-    // Check password
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.status(401).json({ success: false, error: 'Incorrect password.' });
     }
 
-    // Check subscription
     if (!user.team_id || !user.extension_enabled || !isSubscriptionActive(user.subscription_status)) {
       return res.status(403).json({ success: false, error: 'No active subscription. Visit tryautopost.com to subscribe.' });
     }
 
-    // Generate token and save to DB (expires in 12 hours)
     const token = generateToken();
     const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
 
@@ -180,7 +172,6 @@ app.post('/login', async (req, res) => {
       [token, user.id, expiresAt]
     );
 
-    // Clean up old expired tokens for this user
     await db.query(
       `DELETE FROM active_tokens WHERE user_id = $1 AND expires_at < NOW()`,
       [user.id]
@@ -202,14 +193,11 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// POST /verify-session
-// Called by extension background.js and popup.js
 app.post('/verify-session', async (req, res) => {
   try {
     const token = getBearerToken(req) || (req.body && req.body.token);
     if (!token) return res.status(401).json({ success: false, active: false, error: 'No token' });
 
-    // ── Try our own DB token first ──
     const tokenRes = await db.query(
       `SELECT at.user_id, at.expires_at,
               u.email,
@@ -243,7 +231,6 @@ app.post('/verify-session', async (req, res) => {
       });
     }
 
-    // ── Try Clerk JWT as fallback ──
     try {
       const payload = await clerk.verifyToken(token);
       if (payload && payload.sub) {
@@ -279,7 +266,6 @@ app.post('/verify-session', async (req, res) => {
   }
 });
 
-// POST /logout
 app.post('/logout', async (req, res) => {
   try {
     const token = getBearerToken(req) || (req.body && req.body.token);
@@ -291,10 +277,9 @@ app.post('/logout', async (req, res) => {
 });
 
 // ============================================================
-// SIGNUP — called from tryautopost.com after Stripe payment
-// POST /api/auth/signup
-// Body: { email, password }
+// SIGNUP
 // ============================================================
+
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -323,7 +308,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // ============================================================
-// EXISTING WORKING ROUTES — DO NOT TOUCH
+// EXISTING WORKING ROUTES
 // ============================================================
 
 app.get('/api/clerk-test', async (req, res) => {
@@ -383,8 +368,8 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
       customer_email: email,
-      success_url: 'https://tryautopost.com/success',
-      cancel_url: 'https://tryautopost.com/pricing',
+      success_url: 'https://tryautopost.com/success.html',
+      cancel_url: 'https://tryautopost.com/index.html',
       metadata: { email, plan, seatLimit: String(seatLimit) },
       subscription_data: { metadata: { email, plan, seatLimit: String(seatLimit) } },
     });
