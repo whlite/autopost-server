@@ -1,590 +1,1005 @@
-'use strict';
-
-// ============================================================
-// AutoPost Railway Server
-// Auth: email+password in Neon  |  Billing: Stripe  |  DB: Neon Postgres
-// Legacy Google Sheets routes preserved until migration complete
-// ============================================================
-
 const express = require('express');
-const cors = require('cors');
+const fetch = require('node-fetch');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const Stripe = require('stripe');
-const { createClerkClient } = require('@clerk/backend');
-const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
+const { clerkMiddleware, getAuth } = require('@clerk/express');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// ── Clients ──────────────────────────────────────────────────
-const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+const PORT = process.env.PORT || 8080;
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const ANTHROPIC_API_KEY =
+  process.env.ANTHROPIC_API_KEY ||
+  process.env.CLAUDE_API_KEY ||
+  process.env.ANTHROPIC_KEY ||
+  process.env.CLAUDE_KEY;
 
-// ── CORS ─────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = [
-  'https://tryautopost.com',
-  'https://www.tryautopost.com',
-  'chrome-extension://kjoaedklmmpkikmeigaehgaglialdabl',
-];
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
 
-app.use(cors({
-  origin: function (origin, cb) {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    if (/^chrome-extension:\/\//.test(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-}));
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_PRICE_SOLO = process.env.STRIPE_PRICE_SOLO || '';
+const STRIPE_PRICE_TEAM = process.env.STRIPE_PRICE_TEAM || '';
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://tryautopost.com').replace(/\/$/, '');
 
-// ── Raw body for Stripe webhooks (must come BEFORE express.json) ──
-app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-// ── JSON body for everything else ────────────────────────────
-app.use(express.json());
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    })
+  : null;
 
-// ── DB bootstrap — create tables if they don't exist ─────────
-async function bootstrapDB() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS teams (
-      id                     SERIAL PRIMARY KEY,
-      owner_clerk_id         TEXT NOT NULL UNIQUE,
-      plan                   TEXT NOT NULL DEFAULT 'solo',
-      seat_limit             INT  NOT NULL DEFAULT 1,
-      stripe_customer_id     TEXT,
-      stripe_subscription_id TEXT,
-      subscription_status    TEXT DEFAULT 'inactive',
-      extension_enabled      BOOLEAN DEFAULT false,
-      created_at             TIMESTAMPTZ DEFAULT NOW(),
-      updated_at             TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const loginAttempts = new Map();
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS team_members (
-      id         SERIAL PRIMARY KEY,
-      team_id    INT  NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      clerk_id   TEXT NOT NULL UNIQUE,
-      email      TEXT,
-      role       TEXT NOT NULL DEFAULT 'member',
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
+console.log('AutoPost booting...');
+console.log('DATABASE_URL loaded:', !!DATABASE_URL);
+console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
+console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
+console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
+console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
+console.log('STRIPE_SECRET_KEY loaded:', !!STRIPE_SECRET_KEY);
+console.log('STRIPE_PRICE_SOLO loaded:', !!STRIPE_PRICE_SOLO);
+console.log('STRIPE_PRICE_TEAM loaded:', !!STRIPE_PRICE_TEAM);
+console.log('PORT:', PORT);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id            SERIAL PRIMARY KEY,
-      email         TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      team_id       INT REFERENCES teams(id) ON DELETE SET NULL,
-      created_at    TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS active_tokens (
-      token      TEXT PRIMARY KEY,
-      user_id    INT  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  console.log('AutoPost: DB tables ready');
+function now() {
+  return Date.now();
 }
 
-bootstrapDB().catch(err => console.error('AutoPost: DB bootstrap error', err));
+function normalizeEmail(email) {
+  return String(email || '').toLowerCase().trim();
+}
 
-// ============================================================
-// HELPERS
-// ============================================================
+function safeEqual(a, b) {
+  const aString = String(a || '');
+  const bString = String(b || '');
+  const aBuf = Buffer.from(aString);
+  const bBuf = Buffer.from(bString);
 
-function getBearerToken(req) {
-  const auth = req.headers.authorization || '';
-  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  if (aBuf.length !== bBuf.length) return false;
+
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function hashPassword(password, salt) {
+  return crypto
+    .createHash('sha256')
+    .update(String(salt || '') + ':' + String(password || ''))
+    .digest('hex');
+}
+
+function verifyPassword(password, salt, storedHash) {
+  if (!salt || !storedHash) return false;
+  const incoming = hashPassword(password, salt);
+  return safeEqual(incoming, storedHash);
+}
+
+function rateLimitLogin(email, ip) {
+  const key = `${ip}:${normalizeEmail(email)}`;
+  const existing = loginAttempts.get(key) || {
+    count: 0,
+    firstAttempt: now()
+  };
+
+  const windowMs = 1000 * 60 * 10;
+
+  if (now() - existing.firstAttempt > windowMs) {
+    loginAttempts.set(key, { count: 1, firstAttempt: now() });
+    return { allowed: true };
+  }
+
+  existing.count += 1;
+  loginAttempts.set(key, existing);
+
+  if (existing.count > 10) {
+    return {
+      allowed: false,
+      error: 'Too many login attempts. Try again later.'
+    };
+  }
+
+  return { allowed: true };
+}
+
+function createSessionToken(payload) {
+  const session = {
+    clerkUserId: String(payload.clerkUserId || ''),
+    email: normalizeEmail(payload.email),
+    deviceId: String(payload.deviceId || ''),
+    issuedAt: now(),
+    expiresAt: now() + SESSION_TTL_MS
+  };
+
+  const body = Buffer.from(JSON.stringify(session)).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(body)
+    .digest('base64url');
+
+  return `${body}.${sig}`;
+}
+
+function verifySessionToken(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) {
+    return {
+      valid: false,
+      error: 'Missing token'
+    };
+  }
+
+  const parts = token.split('.');
+
+  if (parts.length !== 2) {
+    return {
+      valid: false,
+      error: 'Invalid token format'
+    };
+  }
+
+  const [body, sig] = parts;
+
+  if (!body || !sig) {
+    return {
+      valid: false,
+      error: 'Invalid token format'
+    };
+  }
+
+  const expectedSig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(body)
+    .digest('base64url');
+
+  if (!safeEqual(sig, expectedSig)) {
+    return {
+      valid: false,
+      error: 'Invalid token signature'
+    };
+  }
+
+  let session;
+
+  try {
+    session = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+  } catch (e) {
+    return {
+      valid: false,
+      error: 'Invalid token body'
+    };
+  }
+
+  if (!session.expiresAt || now() > session.expiresAt) {
+    return {
+      valid: false,
+      error: 'Session expired'
+    };
+  }
+
+  return {
+    valid: true,
+    session
+  };
+}
+
+function isAllowedStatus(status) {
+  const s = String(status || '').toLowerCase();
+  return s === 'active' || s === 'trialing';
+}
+
+function planMeta(plan) {
+  if (plan === 'team') {
+    return {
+      plan: 'team',
+      seatLimit: 3,
+      priceId: STRIPE_PRICE_TEAM
+    };
+  }
+
+  return {
+    plan: 'solo',
+    seatLimit: 1,
+    priceId: STRIPE_PRICE_SOLO
+  };
+}
+
+function publicUser(user) {
+  return {
+    username: user.email,
+    email: user.email,
+    clerkUserId: user.clerk_user_id || '',
+    active: isAllowedStatus(user.subscription_status) && user.extension_enabled !== false,
+    plan: user.plan || 'solo',
+    subscriptionStatus: user.subscription_status || 'inactive',
+    deviceLimit: user.seat_limit || 1
+  };
+}
+
+async function initDb() {
+  if (!pool) {
+    console.log('Database not configured.');
+    return;
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS autopost_users (
+      id SERIAL PRIMARY KEY,
+      clerk_user_id TEXT UNIQUE,
+      email TEXT UNIQUE,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      subscription_status TEXT DEFAULT 'inactive',
+      current_period_end TIMESTAMPTZ,
+      extension_enabled BOOLEAN DEFAULT TRUE,
+      plan TEXT DEFAULT 'solo',
+      seat_limit INTEGER DEFAULT 1,
+      password_salt TEXT,
+      password_hash TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`ALTER TABLE autopost_users ADD COLUMN IF NOT EXISTS seat_limit INTEGER DEFAULT 1;`);
+  await pool.query(`ALTER TABLE autopost_users ADD COLUMN IF NOT EXISTS password_salt TEXT;`);
+  await pool.query(`ALTER TABLE autopost_users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS autopost_teams (
+      id SERIAL PRIMARY KEY,
+      owner_clerk_user_id TEXT UNIQUE,
+      owner_email TEXT,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      plan TEXT DEFAULT 'solo',
+      seat_limit INTEGER DEFAULT 1,
+      subscription_status TEXT DEFAULT 'inactive',
+      extension_enabled BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS autopost_team_members (
+      id SERIAL PRIMARY KEY,
+      team_id INTEGER REFERENCES autopost_teams(id) ON DELETE CASCADE,
+      clerk_user_id TEXT UNIQUE,
+      email TEXT,
+      role TEXT DEFAULT 'member',
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  console.log('Database ready: Neon tables checked.');
+}
+
+async function findAccessByEmail(email) {
+  if (!pool) return null;
+
+  const normalized = normalizeEmail(email);
+  const result = await pool.query(
+    `SELECT * FROM autopost_users WHERE LOWER(email) = $1 LIMIT 1`,
+    [normalized]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function findAccessByClerkUserId(clerkUserId) {
+  if (!pool || !clerkUserId) return null;
+
+  const userResult = await pool.query(
+    `SELECT * FROM autopost_users WHERE clerk_user_id = $1 LIMIT 1`,
+    [clerkUserId]
+  );
+
+  if (userResult.rows[0]) return userResult.rows[0];
+
+  const teamResult = await pool.query(
+    `SELECT
+       tm.clerk_user_id,
+       tm.email,
+       t.stripe_customer_id,
+       t.stripe_subscription_id,
+       t.subscription_status,
+       NULL::timestamptz AS current_period_end,
+       t.extension_enabled,
+       t.plan,
+       t.seat_limit,
+       tm.role
+     FROM autopost_team_members tm
+     JOIN autopost_teams t ON t.id = tm.team_id
+     WHERE tm.clerk_user_id = $1
+       AND tm.status = 'active'
+     LIMIT 1`,
+    [clerkUserId]
+  );
+
+  return teamResult.rows[0] || null;
+}
+
+async function findAccessFromSession(session) {
+  if (session.clerkUserId) {
+    const byClerk = await findAccessByClerkUserId(session.clerkUserId);
+    if (byClerk) return byClerk;
+  }
+
+  if (session.email) {
+    return findAccessByEmail(session.email);
+  }
+
   return null;
 }
 
-async function requireClerkAuth(req) {
-  const token = getBearerToken(req);
-  if (!token) throw new Error('Missing auth token');
-  const payload = await clerk.verifyToken(token);
-  if (!payload || !payload.sub) throw new Error('Invalid token');
-  let email = '';
+async function requireActiveSession(req, res, next) {
   try {
-    const user = await clerk.users.getUser(payload.sub);
-    email = (user.emailAddresses && user.emailAddresses[0] && user.emailAddresses[0].emailAddress) || '';
-  } catch (_) {}
-  return { clerkUserId: payload.sub, email };
-}
+    const auth = req.headers.authorization || '';
+    const tokenFromHeader = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const token = tokenFromHeader || (req.body && req.body.token);
 
-function isSubscriptionActive(status) {
-  return status === 'active' || status === 'trialing';
-}
+    const verified = verifySessionToken(token);
 
-function generateToken() {
-  return 'ap_' + crypto.randomBytes(32).toString('hex');
-}
-
-// ============================================================
-// EMAIL + PASSWORD AUTH (extension login)
-// ============================================================
-
-app.post('/login', async (req, res) => {
-  try {
-    const { username, password } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ success: false, error: 'Enter your email and password.' });
-    }
-
-    const email = username.toLowerCase().trim();
-
-    const userRes = await db.query(
-      `SELECT u.id, u.email, u.password_hash, u.team_id,
-              t.plan, t.subscription_status, t.extension_enabled
-       FROM users u
-       LEFT JOIN teams t ON t.id = u.team_id
-       WHERE u.email = $1`,
-      [email]
-    );
-
-    if (userRes.rows.length === 0) {
-      return res.status(401).json({ success: false, error: 'No account found. Sign up at tryautopost.com.' });
-    }
-
-    const user = userRes.rows[0];
-
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) {
-      return res.status(401).json({ success: false, error: 'Incorrect password.' });
-    }
-
-    if (!user.team_id || !user.extension_enabled || !isSubscriptionActive(user.subscription_status)) {
-      return res.status(403).json({ success: false, error: 'No active subscription. Visit tryautopost.com to subscribe.' });
-    }
-
-    const token = generateToken();
-    const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
-
-    await db.query(
-      `INSERT INTO active_tokens (token, user_id, expires_at) VALUES ($1, $2, $3)`,
-      [token, user.id, expiresAt]
-    );
-
-    await db.query(
-      `DELETE FROM active_tokens WHERE user_id = $1 AND expires_at < NOW()`,
-      [user.id]
-    );
-
-    res.json({
-      success: true,
-      token,
-      expiresInSeconds: 43200,
-      user: {
-        username: user.email,
-        plan: user.plan,
-        subscriptionStatus: user.subscription_status,
-      },
-    });
-  } catch (err) {
-    console.error('/login error', err);
-    res.status(500).json({ success: false, error: 'Server error. Try again.' });
-  }
-});
-
-app.post('/verify-session', async (req, res) => {
-  try {
-    const token = getBearerToken(req) || (req.body && req.body.token);
-    if (!token) return res.status(401).json({ success: false, active: false, error: 'No token' });
-
-    const tokenRes = await db.query(
-      `SELECT at.user_id, at.expires_at,
-              u.email,
-              t.plan, t.subscription_status, t.extension_enabled
-       FROM active_tokens at
-       JOIN users u ON u.id = at.user_id
-       LEFT JOIN teams t ON t.id = u.team_id
-       WHERE at.token = $1`,
-      [token]
-    );
-
-    if (tokenRes.rows.length > 0) {
-      const row = tokenRes.rows[0];
-
-      if (new Date() > new Date(row.expires_at)) {
-        await db.query('DELETE FROM active_tokens WHERE token = $1', [token]);
-        return res.json({ success: false, active: false, error: 'Session expired. Please sign in again.' });
-      }
-
-      const active = row.extension_enabled && isSubscriptionActive(row.subscription_status);
-
-      return res.json({
-        success: true,
-        active,
-        allowed: active,
-        user: {
-          username: row.email,
-          plan: row.plan,
-          subscriptionStatus: row.subscription_status,
-        },
+    if (!verified.valid) {
+      return res.status(401).json({
+        success: false,
+        active: false,
+        error: verified.error
       });
     }
 
-    try {
-      const payload = await clerk.verifyToken(token);
-      if (payload && payload.sub) {
-        const memberRow = await db.query(
-          `SELECT tm.*, t.plan, t.seat_limit, t.subscription_status, t.extension_enabled
-           FROM team_members tm
-           JOIN teams t ON t.id = tm.team_id
-           WHERE tm.clerk_id = $1`,
-          [payload.sub]
+    const user = await findAccessFromSession(verified.session);
+    const active =
+      user &&
+      isAllowedStatus(user.subscription_status) &&
+      user.extension_enabled !== false;
+
+    if (!active) {
+      return res.status(403).json({
+        success: false,
+        active: false,
+        error: 'No active subscription. Visit tryautopost.com to subscribe.'
+      });
+    }
+
+    req.session = verified.session;
+    req.user = user;
+    next();
+  } catch (e) {
+    console.error('Session check error:', e.message);
+    return res.status(500).json({
+      success: false,
+      active: false,
+      error: 'Server error'
+    });
+  }
+}
+
+async function upsertUserFromSubscription({
+  clerkUserId,
+  email,
+  stripeCustomerId,
+  stripeSubscriptionId,
+  status,
+  plan,
+  seatLimit,
+  currentPeriodEnd
+}) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!pool || !normalizedEmail) return;
+
+  await pool.query(
+    `INSERT INTO autopost_users (
+       clerk_user_id,
+       email,
+       stripe_customer_id,
+       stripe_subscription_id,
+       subscription_status,
+       current_period_end,
+       extension_enabled,
+       plan,
+       seat_limit,
+       created_at,
+       updated_at
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8,NOW(),NOW())
+     ON CONFLICT (email)
+     DO UPDATE SET
+       clerk_user_id = COALESCE(EXCLUDED.clerk_user_id, autopost_users.clerk_user_id),
+       stripe_customer_id = EXCLUDED.stripe_customer_id,
+       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+       subscription_status = EXCLUDED.subscription_status,
+       current_period_end = EXCLUDED.current_period_end,
+       extension_enabled = CASE WHEN EXCLUDED.subscription_status IN ('active','trialing') THEN true ELSE false END,
+       plan = EXCLUDED.plan,
+       seat_limit = EXCLUDED.seat_limit,
+       updated_at = NOW()`,
+    [
+      clerkUserId || null,
+      normalizedEmail,
+      stripeCustomerId || null,
+      stripeSubscriptionId || null,
+      status || 'inactive',
+      currentPeriodEnd || null,
+      plan || 'solo',
+      seatLimit || 1
+    ]
+  );
+
+  if (clerkUserId) {
+    await pool.query(
+      `INSERT INTO autopost_teams (
+         owner_clerk_user_id,
+         owner_email,
+         stripe_customer_id,
+         stripe_subscription_id,
+         plan,
+         seat_limit,
+         subscription_status,
+         extension_enabled,
+         created_at,
+         updated_at
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+       ON CONFLICT (owner_clerk_user_id)
+       DO UPDATE SET
+         owner_email = EXCLUDED.owner_email,
+         stripe_customer_id = EXCLUDED.stripe_customer_id,
+         stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+         plan = EXCLUDED.plan,
+         seat_limit = EXCLUDED.seat_limit,
+         subscription_status = EXCLUDED.subscription_status,
+         extension_enabled = EXCLUDED.extension_enabled,
+         updated_at = NOW()
+       RETURNING id`,
+      [
+        clerkUserId,
+        normalizedEmail,
+        stripeCustomerId || null,
+        stripeSubscriptionId || null,
+        plan || 'solo',
+        seatLimit || 1,
+        status || 'inactive',
+        isAllowedStatus(status)
+      ]
+    );
+
+    const team = await pool.query(
+      `SELECT id FROM autopost_teams WHERE owner_clerk_user_id = $1 LIMIT 1`,
+      [clerkUserId]
+    );
+
+    const teamId = team.rows[0] && team.rows[0].id;
+
+    if (teamId) {
+      await pool.query(
+        `INSERT INTO autopost_team_members (
+           team_id,
+           clerk_user_id,
+           email,
+           role,
+           status,
+           created_at,
+           updated_at
+         )
+         VALUES ($1,$2,$3,'owner','active',NOW(),NOW())
+         ON CONFLICT (clerk_user_id)
+         DO UPDATE SET
+           team_id = EXCLUDED.team_id,
+           email = EXCLUDED.email,
+           role = 'owner',
+           status = 'active',
+           updated_at = NOW()`,
+        [teamId, clerkUserId, normalizedEmail]
+      );
+    }
+  }
+}
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+      return res.status(500).send('Stripe webhook not configured');
+    }
+
+    const sig = req.headers['stripe-signature'];
+    const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const plan = session.metadata && session.metadata.plan === 'team' ? 'team' : 'solo';
+      const meta = planMeta(plan);
+
+      let subscription = null;
+
+      if (session.subscription) {
+        subscription = await stripe.subscriptions.retrieve(session.subscription);
+      }
+
+      await upsertUserFromSubscription({
+        clerkUserId: session.metadata && session.metadata.clerkUserId,
+        email:
+          (session.customer_details && session.customer_details.email) ||
+          (session.metadata && session.metadata.email),
+        stripeCustomerId: session.customer,
+        stripeSubscriptionId: session.subscription,
+        status: subscription ? subscription.status : 'active',
+        plan: meta.plan,
+        seatLimit: meta.seatLimit,
+        currentPeriodEnd:
+          subscription && subscription.current_period_end
+            ? new Date(subscription.current_period_end * 1000)
+            : null
+      });
+    }
+
+    if (
+      event.type === 'customer.subscription.created' ||
+      event.type === 'customer.subscription.updated' ||
+      event.type === 'customer.subscription.deleted'
+    ) {
+      const sub = event.data.object;
+      const plan = sub.metadata && sub.metadata.plan === 'team' ? 'team' : 'solo';
+      const meta = planMeta(plan);
+
+      await upsertUserFromSubscription({
+        clerkUserId: sub.metadata && sub.metadata.clerkUserId,
+        email: sub.metadata && sub.metadata.email,
+        stripeCustomerId: sub.customer,
+        stripeSubscriptionId: sub.id,
+        status: event.type === 'customer.subscription.deleted' ? 'canceled' : sub.status,
+        plan: meta.plan,
+        seatLimit: meta.seatLimit,
+        currentPeriodEnd: sub.current_period_end
+          ? new Date(sub.current_period_end * 1000)
+          : null
+      });
+    }
+
+    if (event.type === 'invoice.payment_failed') {
+      const invoice = event.data.object;
+
+      if (invoice.subscription && pool) {
+        await pool.query(
+          `UPDATE autopost_users
+           SET subscription_status = 'past_due',
+               extension_enabled = false,
+               updated_at = NOW()
+           WHERE stripe_subscription_id = $1`,
+          [invoice.subscription]
         );
 
-        if (memberRow.rows.length > 0) {
-          const row = memberRow.rows[0];
-          const active = row.extension_enabled && isSubscriptionActive(row.subscription_status);
-          return res.json({
-            success: true,
-            active,
-            allowed: active,
-            user: {
-              username: row.email || payload.sub,
-              plan: row.plan,
-              subscriptionStatus: row.subscription_status,
-            },
-          });
-        }
+        await pool.query(
+          `UPDATE autopost_teams
+           SET subscription_status = 'past_due',
+               extension_enabled = false,
+               updated_at = NOW()
+           WHERE stripe_subscription_id = $1`,
+          [invoice.subscription]
+        );
       }
-    } catch (_) {}
+    }
 
-    return res.status(401).json({ success: false, active: false, error: 'Invalid or expired session. Please sign in again.' });
-  } catch (err) {
-    console.error('/verify-session error', err);
-    res.status(500).json({ success: false, active: false, error: 'Server error' });
+    return res.json({ received: true });
+  } catch (e) {
+    console.error('Stripe webhook error:', e.message);
+    return res.status(400).send(`Webhook Error: ${e.message}`);
   }
 });
 
-app.post('/logout', async (req, res) => {
-  try {
-    const token = getBearerToken(req) || (req.body && req.body.token);
-    if (token) await db.query('DELETE FROM active_tokens WHERE token = $1', [token]);
-    res.json({ success: true });
-  } catch (_) {
-    res.json({ success: true });
-  }
+app.use(express.json({ limit: '10mb' }));
+app.use(clerkMiddleware());
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+
+  next();
 });
 
-// ============================================================
-// SIGNUP
-// ============================================================
-
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email and password required.' });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters.' });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-
-    const existing = await db.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ success: false, error: 'An account with that email already exists.' });
-    }
-
-    const hash = await bcrypt.hash(password, 12);
-    await db.query('INSERT INTO users (email, password_hash) VALUES ($1, $2)', [normalizedEmail, hash]);
-
-    res.json({ success: true, message: 'Account created. You can now sign in to the extension.' });
-  } catch (err) {
-    console.error('/api/auth/signup error', err);
-    res.status(500).json({ success: false, error: 'Server error.' });
-  }
+app.get('/', (req, res) => {
+  res.json({
+    status: 'AutoPost server running',
+    version: '3.0-neon-stripe-only',
+    auth: 'neon + stripe + clerk metadata',
+    googleSheets: false,
+    aiConfigured: !!ANTHROPIC_API_KEY,
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
+    databaseLoaded: !!DATABASE_URL,
+    stripeLoaded: !!STRIPE_SECRET_KEY
+  });
 });
 
-// ============================================================
-// EXISTING WORKING ROUTES
-// ============================================================
-
-app.get('/api/clerk-test', async (req, res) => {
-  try {
-    const users = await clerk.users.getUserList({ limit: 1 });
-    res.json({ success: true, clerkConnected: true, userCount: users.totalCount });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    version: '3.0-neon-stripe-only',
+    time: new Date().toISOString(),
+    googleSheets: false,
+    aiConfigured: !!ANTHROPIC_API_KEY,
+    databaseLoaded: !!DATABASE_URL,
+    stripeLoaded: !!STRIPE_SECRET_KEY
+  });
 });
 
 app.get('/api/db-test', async (req, res) => {
   try {
-    const result = await db.query('SELECT NOW() AS now');
-    res.json({ success: true, dbConnected: true, serverTime: result.rows[0].now });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    if (!pool) {
+      return res.status(500).json({
+        success: false,
+        error: 'DATABASE_URL is missing'
+      });
+    }
+
+    const result = await pool.query('SELECT NOW() AS now');
+
+    return res.json({
+      success: true,
+      databaseConnected: true,
+      time: result.rows[0].now
+    });
+  } catch (e) {
+    return res.status(500).json({
+      success: false,
+      databaseConnected: false,
+      error: e.message
+    });
   }
 });
 
-app.post('/describe', async (req, res) => {
-  res.json({ success: true, description: '' });
-});
+app.get('/api/clerk-test', (req, res) => {
+  const auth = getAuth(req);
 
-// ============================================================
-// STRIPE CONFIG TEST
-// ============================================================
-
-app.get('/api/stripe-config-test', (req, res) => {
-  res.json({
+  return res.json({
     success: true,
-    STRIPE_SECRET_KEY:     !!process.env.STRIPE_SECRET_KEY,
-    STRIPE_PRICE_SOLO:     !!process.env.STRIPE_PRICE_SOLO,
-    STRIPE_PRICE_TEAM:     !!process.env.STRIPE_PRICE_TEAM,
-    STRIPE_WEBHOOK_SECRET: !!process.env.STRIPE_WEBHOOK_SECRET,
+    clerkLoaded: !!process.env.CLERK_SECRET_KEY,
+    isAuthenticated: !!auth.isAuthenticated,
+    userId: auth.userId || null,
+    sessionId: auth.sessionId || null
   });
 });
 
-// ============================================================
-// STRIPE CHECKOUT SESSION
-// ============================================================
+app.get('/api/stripe-config-test', (req, res) => {
+  return res.json({
+    success: true,
+    stripeSecretLoaded: !!STRIPE_SECRET_KEY,
+    soloPriceLoaded: !!STRIPE_PRICE_SOLO,
+    teamPriceLoaded: !!STRIPE_PRICE_TEAM,
+    webhookSecretLoaded: !!STRIPE_WEBHOOK_SECRET,
+    frontendUrl: FRONTEND_URL
+  });
+});
 
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
   try {
-    const { email, plan } = req.body || {};
-    if (!email) return res.status(400).json({ success: false, error: 'Email required.' });
-    if (!plan || !['solo', 'team'].includes(plan)) {
-      return res.status(400).json({ success: false, error: 'plan must be "solo" or "team"' });
+    if (!stripe) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe is not configured'
+      });
     }
 
-    const priceId = plan === 'solo' ? process.env.STRIPE_PRICE_SOLO : process.env.STRIPE_PRICE_TEAM;
-    if (!priceId) return res.status(500).json({ success: false, error: `STRIPE_PRICE_${plan.toUpperCase()} not configured` });
+    const auth = getAuth(req);
 
-    const seatLimit = plan === 'solo' ? 1 : 3;
+    if (!auth.isAuthenticated || !auth.userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Please sign in first.'
+      });
+    }
+
+    const requestedPlan = req.body && req.body.plan === 'team' ? 'team' : 'solo';
+    const meta = planMeta(requestedPlan);
+
+    if (!meta.priceId) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe price is missing for plan.'
+      });
+    }
+
+    const email = normalizeEmail(req.body.email || '');
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      line_items: [{ price: priceId, quantity: 1 }],
-      customer_email: email,
-      success_url: 'https://tryautopost.com/success.html',
-      cancel_url: 'https://tryautopost.com/index.html',
-      metadata: { email, plan, seatLimit: String(seatLimit) },
-      subscription_data: { metadata: { email, plan, seatLimit: String(seatLimit) } },
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: meta.priceId,
+          quantity: 1
+        }
+      ],
+      success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/pricing`,
+      customer_email: email || undefined,
+      metadata: {
+        clerkUserId: auth.userId,
+        email,
+        plan: meta.plan,
+        seatLimit: String(meta.seatLimit)
+      },
+      subscription_data: {
+        metadata: {
+          clerkUserId: auth.userId,
+          email,
+          plan: meta.plan,
+          seatLimit: String(meta.seatLimit)
+        }
+      }
     });
 
-    res.json({ success: true, url: session.url });
-  } catch (err) {
-    console.error('/api/stripe/create-checkout-session error', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.json({
+      success: true,
+      url: session.url
+    });
+  } catch (e) {
+    console.error('Checkout session error:', e.message);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Could not create checkout session'
+    });
   }
 });
 
-// ============================================================
-// STRIPE WEBHOOK
-// ============================================================
-
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-
-app.post('/api/stripe/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
+app.post('/login', async (req, res) => {
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Stripe webhook signature error:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+    const { username, password, deviceId } = req.body || {};
+    const email = normalizeEmail(username);
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
 
-  try {
-    await handleStripeEvent(event);
-    res.json({ received: true });
-  } catch (err) {
-    console.error('Stripe webhook handler error:', err);
-    res.status(500).json({ error: 'Webhook handler failed' });
+    const limited = rateLimitLogin(email, ip);
+
+    if (!limited.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: limited.error
+      });
+    }
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Enter email and password'
+      });
+    }
+
+    const user = await findAccessByEmail(email);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Account not found. Create an AutoPost account first.'
+      });
+    }
+
+    if (!verifyPassword(password, user.password_salt, user.password_hash)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
+    }
+
+    const active =
+      isAllowedStatus(user.subscription_status) &&
+      user.extension_enabled !== false;
+
+    if (!active) {
+      return res.status(403).json({
+        success: false,
+        error: 'No active subscription. Visit tryautopost.com to subscribe.'
+      });
+    }
+
+    const token = createSessionToken({
+      clerkUserId: user.clerk_user_id || '',
+      email: user.email,
+      deviceId
+    });
+
+    return res.json({
+      success: true,
+      token,
+      expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
+      user: publicUser(user)
+    });
+  } catch (e) {
+    console.error('Login error:', e.message);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
   }
 });
 
-async function handleStripeEvent(event) {
-  const type = event.type;
-  console.log('AutoPost stripe event:', type);
+app.post('/verify-session', requireActiveSession, async (req, res) => {
+  return res.json({
+    success: true,
+    active: true,
+    user: publicUser(req.user)
+  });
+});
 
-  if (type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const meta = session.metadata || {};
-    const email      = meta.email || '';
-    const plan       = meta.plan || 'solo';
-    const seatLimit  = parseInt(meta.seatLimit || '1', 10);
-    const customerId = session.customer;
-    const subId      = session.subscription;
-    if (!email) { console.error('checkout.session.completed: no email in metadata'); return; }
-    await upsertTeamForEmail({ email, plan, seatLimit, customerId, subId, status: 'active', enabled: true });
-    return;
-  }
-
-  if (
-    type === 'customer.subscription.created' ||
-    type === 'customer.subscription.updated' ||
-    type === 'customer.subscription.deleted'
-  ) {
-    const sub = event.data.object;
-    const meta = sub.metadata || {};
-    const email = meta.email || '';
-    const plan = meta.plan || 'solo';
-    const seatLimit = parseInt(meta.seatLimit || '1', 10);
-    const customerId = sub.customer;
-    const subId = sub.id;
-    const status = sub.status;
-    const enabled = isSubscriptionActive(status);
-    if (!email) return;
-    await upsertTeamForEmail({ email, plan, seatLimit, customerId, subId, status, enabled });
-    return;
-  }
-
-  if (type === 'invoice.paid') {
-    const subId = event.data.object.subscription;
-    if (!subId) return;
-    await db.query(
-      `UPDATE teams SET subscription_status = 'active', extension_enabled = true, updated_at = NOW() WHERE stripe_subscription_id = $1`,
-      [subId]
-    );
-    return;
-  }
-
-  if (type === 'invoice.payment_failed') {
-    const subId = event.data.object.subscription;
-    if (!subId) return;
-    await db.query(
-      `UPDATE teams SET subscription_status = 'past_due', extension_enabled = false, updated_at = NOW() WHERE stripe_subscription_id = $1`,
-      [subId]
-    );
-    return;
-  }
-}
-
-async function upsertTeamForEmail({ email, plan, seatLimit, customerId, subId, status, enabled }) {
-  const normalizedEmail = email.toLowerCase();
-
-  const userRes = await db.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
-  if (userRes.rows.length === 0) {
-    console.warn('upsertTeamForEmail: no user found for email', email);
-    return;
-  }
-
-  const userId = userRes.rows[0].id;
-
-  const teamRes = await db.query(
-    `INSERT INTO teams (owner_clerk_id, plan, seat_limit, stripe_customer_id, stripe_subscription_id, subscription_status, extension_enabled, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-     ON CONFLICT (owner_clerk_id) DO UPDATE SET
-       plan = EXCLUDED.plan,
-       seat_limit = EXCLUDED.seat_limit,
-       stripe_customer_id = EXCLUDED.stripe_customer_id,
-       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-       subscription_status = EXCLUDED.subscription_status,
-       extension_enabled = EXCLUDED.extension_enabled,
-       updated_at = NOW()
-     RETURNING id`,
-    [normalizedEmail, plan, seatLimit, customerId, subId, status, enabled]
-  );
-
-  const teamId = teamRes.rows[0].id;
-
-  await db.query('UPDATE users SET team_id = $1 WHERE id = $2', [teamId, userId]);
-
-  await db.query(
-    `INSERT INTO team_members (team_id, clerk_id, email, role)
-     VALUES ($1, $2, $3, 'owner')
-     ON CONFLICT (clerk_id) DO UPDATE SET team_id = EXCLUDED.team_id, email = EXCLUDED.email`,
-    [teamId, normalizedEmail, normalizedEmail]
-  );
-}
-
-// ============================================================
-// EXTENSION ACCESS CHECK
-// ============================================================
+app.post('/logout', (req, res) => {
+  return res.json({
+    success: true
+  });
+});
 
 app.get('/api/extension/access', async (req, res) => {
   try {
-    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
-    const result = await db.query(
-      `SELECT tm.role, tm.email, t.plan, t.seat_limit, t.subscription_status, t.extension_enabled,
-              (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS seats_used
-       FROM team_members tm
-       JOIN teams t ON t.id = tm.team_id
-       WHERE tm.clerk_id = $1`,
-      [clerkUserId]
-    );
-    if (result.rows.length === 0) {
-      return res.json({ allowed: false, status: 'no_subscription', plan: null, seatLimit: 0, seatsUsed: 0, role: null, extensionEnabled: false });
-    }
-    const row = result.rows[0];
-    const allowed = row.extension_enabled && isSubscriptionActive(row.subscription_status);
-    res.json({ allowed, status: row.subscription_status, plan: row.plan, seatLimit: row.seat_limit, seatsUsed: parseInt(row.seats_used, 10), role: row.role, extensionEnabled: row.extension_enabled });
-  } catch (err) {
-    res.status(err.status || 500).json({ allowed: false, error: err.message });
-  }
-});
+    let user = null;
+    const authHeader = req.headers.authorization || '';
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
 
-// ============================================================
-// TEAM MEMBER MANAGEMENT
-// ============================================================
-
-app.post('/api/team/add-member', async (req, res) => {
-  try {
-    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
-    const { memberEmail } = req.body || {};
-    if (!memberEmail) return res.status(400).json({ success: false, error: 'memberEmail required' });
-
-    const ownerCheck = await db.query(
-      `SELECT t.id, t.seat_limit, (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS seats_used
-       FROM teams t JOIN team_members tm ON tm.team_id = t.id
-       WHERE tm.clerk_id = $1 AND tm.role = 'owner'`,
-      [clerkUserId]
-    );
-    if (ownerCheck.rows.length === 0) return res.status(403).json({ success: false, error: 'Only the team owner can add members.' });
-
-    const { id: teamId, seat_limit, seats_used } = ownerCheck.rows[0];
-    if (parseInt(seats_used, 10) >= parseInt(seat_limit, 10)) {
-      return res.status(400).json({ success: false, error: `Seat limit (${seat_limit}) reached.` });
+    if (bearer && bearer.includes('.')) {
+      const verified = verifySessionToken(bearer);
+      if (verified.valid) {
+        user = await findAccessFromSession(verified.session);
+      }
     }
 
-    const normalizedMember = memberEmail.toLowerCase();
-    const memberUser = await db.query('SELECT id FROM users WHERE email = $1', [normalizedMember]);
-    if (memberUser.rows.length === 0) return res.status(404).json({ success: false, error: 'That email has no AutoPost account yet.' });
+    if (!user) {
+      const auth = getAuth(req);
+      if (auth.isAuthenticated && auth.userId) {
+        user = await findAccessByClerkUserId(auth.userId);
+      }
+    }
 
-    const existing = await db.query('SELECT id FROM team_members WHERE clerk_id = $1', [normalizedMember]);
-    if (existing.rows.length > 0) return res.status(400).json({ success: false, error: 'That user already belongs to a team.' });
+    if (!user) {
+      return res.status(401).json({
+        allowed: false,
+        status: 'unauthenticated',
+        error: 'Please sign in.'
+      });
+    }
 
-    await db.query(`INSERT INTO team_members (team_id, clerk_id, email, role) VALUES ($1, $2, $3, 'member')`, [teamId, normalizedMember, normalizedMember]);
-    await db.query('UPDATE users SET team_id = $1 WHERE email = $2', [teamId, normalizedMember]);
+    const status = String(user.subscription_status || 'inactive').toLowerCase();
+    const allowed =
+      user.extension_enabled !== false &&
+      isAllowedStatus(status);
 
-    res.json({ success: true, message: `${memberEmail} added to your team.` });
-  } catch (err) {
-    res.status(err.status || 500).json({ success: false, error: err.message });
+    return res.json({
+      allowed,
+      active: allowed,
+      status,
+      plan: user.plan || 'solo',
+      seatLimit: user.seat_limit || 1,
+      role: user.role || 'owner',
+      extensionEnabled: user.extension_enabled !== false
+    });
+  } catch (e) {
+    console.error('Extension access error:', e.message);
+
+    return res.status(500).json({
+      allowed: false,
+      status: 'server_error',
+      error: 'Server error'
+    });
   }
 });
 
-app.get('/api/team/members', async (req, res) => {
+app.post('/describe', requireActiveSession, async (req, res) => {
   try {
-    const { clerkUserId } = await requireClerkAuth(req).catch(e => { throw Object.assign(e, { status: 401 }); });
-    const result = await db.query(
-      `SELECT tm2.clerk_id, tm2.email, tm2.role, tm2.created_at
-       FROM team_members tm JOIN teams t ON t.id = tm.team_id JOIN team_members tm2 ON tm2.team_id = t.id
-       WHERE tm.clerk_id = $1 ORDER BY tm2.created_at`,
-      [clerkUserId]
-    );
-    res.json({ success: true, members: result.rows });
-  } catch (err) {
-    res.status(err.status || 500).json({ success: false, error: err.message });
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(501).json({
+        success: false,
+        error: 'AI description service is not configured'
+      });
+    }
+
+    const { vehicle = {}, settings = {} } = req.body || {};
+
+    const extra = String(settings.aiInstructions || '').trim();
+    const dealerText = String(vehicle.dealerDescription || '').slice(0, 2000);
+    const mileage = vehicle.mileage
+      ? Number(vehicle.mileage).toLocaleString() + ' miles'
+      : '';
+
+    const prompt = `You are writing a Facebook Marketplace car listing. Use this exact format:
+
+2019 Mercedes-Benz GLC 300
+- Exterior: Polar White
+- Interior: Black
+- Drivetrain: AWD 4MATIC
+- Transmission: 9-Speed Automatic
+- Engine: 2.0L Turbocharged 4-Cylinder
+- Mileage: 66,131 miles
+
+DM for more info! We carry Porsche, Mercedes & Audi.
+
+Vehicle title: ${vehicle.title || 'Unknown'}
+Exterior color: ${vehicle.color || 'find in dealer text'}
+${mileage ? 'Mileage: ' + mileage : ''}
+
+Dealer page text:
+${dealerText || 'Not available'}
+
+Rules:
+1. First line must be year make model only.
+2. Specs must use "- Label: Value".
+3. Do not invent colors.
+4. Use known vehicle specs only when highly confident.
+5. Do not include emojis.
+6. After specs, add one blank line.
+${extra ? '7. Then add this text exactly:\n' + extra : '7. End with: DM for more info!'}
+
+Write the listing now.`;
+
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 500,
+        messages: [
+          {
+            role: 'user',
+            content: prompt
+          }
+        ]
+      })
+    });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      console.error('Anthropic error:', aiRes.status, errText.slice(0, 500));
+
+      return res.status(502).json({
+        success: false,
+        error: 'AI description failed'
+      });
+    }
+
+    const data = await aiRes.json();
+    const description =
+      data.content && data.content[0]
+        ? data.content[0].text.trim()
+        : '';
+
+    return res.json({
+      success: true,
+      description
+    });
+  } catch (e) {
+    console.error('Describe error:', e.message);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
   }
 });
 
-// ============================================================
-// HEALTH
-// ============================================================
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    error: 'Route not found'
+  });
+});
 
-app.get('/health', (req, res) => res.json({ ok: true, version: '3.12' }));
-
-app.listen(PORT, () => console.log(`AutoPost server listening on port ${PORT}`));
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`AutoPost running on port ${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error('Database startup error:', e.message);
+    process.exit(1);
+  });
