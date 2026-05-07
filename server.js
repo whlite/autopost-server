@@ -14,11 +14,9 @@ const ANTHROPIC_API_KEY =
   process.env.CLAUDE_API_KEY ||
   process.env.ANTHROPIC_KEY ||
   process.env.CLAUDE_KEY;
-
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
-
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_SOLO = process.env.STRIPE_PRICE_SOLO || '';
@@ -26,7 +24,6 @@ const STRIPE_PRICE_TEAM = process.env.STRIPE_PRICE_TEAM || '';
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://tryautopost.com').replace(/\/$/, '');
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
-
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
@@ -61,9 +58,7 @@ function safeEqual(a, b) {
   const bString = String(b || '');
   const aBuf = Buffer.from(aString);
   const bBuf = Buffer.from(bString);
-
   if (aBuf.length !== bBuf.length) return false;
-
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
@@ -82,28 +77,17 @@ function verifyPassword(password, salt, storedHash) {
 
 function rateLimitLogin(email, ip) {
   const key = `${ip}:${normalizeEmail(email)}`;
-  const existing = loginAttempts.get(key) || {
-    count: 0,
-    firstAttempt: now()
-  };
-
+  const existing = loginAttempts.get(key) || { count: 0, firstAttempt: now() };
   const windowMs = 1000 * 60 * 10;
-
   if (now() - existing.firstAttempt > windowMs) {
     loginAttempts.set(key, { count: 1, firstAttempt: now() });
     return { allowed: true };
   }
-
   existing.count += 1;
   loginAttempts.set(key, existing);
-
   if (existing.count > 10) {
-    return {
-      allowed: false,
-      error: 'Too many login attempts. Try again later.'
-    };
+    return { allowed: false, error: 'Too many login attempts. Try again later.' };
   }
-
   return { allowed: true };
 }
 
@@ -115,76 +99,31 @@ function createSessionToken(payload) {
     issuedAt: now(),
     expiresAt: now() + SESSION_TTL_MS
   };
-
   const body = Buffer.from(JSON.stringify(session)).toString('base64url');
-  const sig = crypto
-    .createHmac('sha256', SESSION_SECRET)
-    .update(body)
-    .digest('base64url');
-
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
   return `${body}.${sig}`;
 }
 
 function verifySessionToken(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) {
-    return {
-      valid: false,
-      error: 'Missing token'
-    };
+    return { valid: false, error: 'Missing token' };
   }
-
   const parts = token.split('.');
-
-  if (parts.length !== 2) {
-    return {
-      valid: false,
-      error: 'Invalid token format'
-    };
-  }
-
+  if (parts.length !== 2) return { valid: false, error: 'Invalid token format' };
   const [body, sig] = parts;
-
-  if (!body || !sig) {
-    return {
-      valid: false,
-      error: 'Invalid token format'
-    };
-  }
-
-  const expectedSig = crypto
-    .createHmac('sha256', SESSION_SECRET)
-    .update(body)
-    .digest('base64url');
-
-  if (!safeEqual(sig, expectedSig)) {
-    return {
-      valid: false,
-      error: 'Invalid token signature'
-    };
-  }
-
+  if (!body || !sig) return { valid: false, error: 'Invalid token format' };
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  if (!safeEqual(sig, expectedSig)) return { valid: false, error: 'Invalid token signature' };
   let session;
-
   try {
     session = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
   } catch (e) {
-    return {
-      valid: false,
-      error: 'Invalid token body'
-    };
+    return { valid: false, error: 'Invalid token body' };
   }
-
   if (!session.expiresAt || now() > session.expiresAt) {
-    return {
-      valid: false,
-      error: 'Session expired'
-    };
+    return { valid: false, error: 'Session expired' };
   }
-
-  return {
-    valid: true,
-    session
-  };
+  return { valid: true, session };
 }
 
 function isAllowedStatus(status) {
@@ -193,19 +132,8 @@ function isAllowedStatus(status) {
 }
 
 function planMeta(plan) {
-  if (plan === 'team') {
-    return {
-      plan: 'team',
-      seatLimit: 3,
-      priceId: STRIPE_PRICE_TEAM
-    };
-  }
-
-  return {
-    plan: 'solo',
-    seatLimit: 1,
-    priceId: STRIPE_PRICE_SOLO
-  };
+  if (plan === 'team') return { plan: 'team', seatLimit: 3, priceId: STRIPE_PRICE_TEAM };
+  return { plan: 'solo', seatLimit: 1, priceId: STRIPE_PRICE_SOLO };
 }
 
 function publicUser(user) {
@@ -283,13 +211,11 @@ async function initDb() {
 
 async function findAccessByEmail(email) {
   if (!pool) return null;
-
   const normalized = normalizeEmail(email);
   const result = await pool.query(
     `SELECT * FROM autopost_users WHERE LOWER(email) = $1 LIMIT 1`,
     [normalized]
   );
-
   return result.rows[0] || null;
 }
 
@@ -300,7 +226,6 @@ async function findAccessByClerkUserId(clerkUserId) {
     `SELECT * FROM autopost_users WHERE clerk_user_id = $1 LIMIT 1`,
     [clerkUserId]
   );
-
   if (userResult.rows[0]) return userResult.rows[0];
 
   const teamResult = await pool.query(
@@ -322,7 +247,6 @@ async function findAccessByClerkUserId(clerkUserId) {
      LIMIT 1`,
     [clerkUserId]
   );
-
   return teamResult.rows[0] || null;
 }
 
@@ -331,11 +255,7 @@ async function findAccessFromSession(session) {
     const byClerk = await findAccessByClerkUserId(session.clerkUserId);
     if (byClerk) return byClerk;
   }
-
-  if (session.email) {
-    return findAccessByEmail(session.email);
-  }
-
+  if (session.email) return findAccessByEmail(session.email);
   return null;
 }
 
@@ -344,22 +264,14 @@ async function requireActiveSession(req, res, next) {
     const auth = req.headers.authorization || '';
     const tokenFromHeader = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     const token = tokenFromHeader || (req.body && req.body.token);
-
     const verified = verifySessionToken(token);
 
     if (!verified.valid) {
-      return res.status(401).json({
-        success: false,
-        active: false,
-        error: verified.error
-      });
+      return res.status(401).json({ success: false, active: false, error: verified.error });
     }
 
     const user = await findAccessFromSession(verified.session);
-    const active =
-      user &&
-      isAllowedStatus(user.subscription_status) &&
-      user.extension_enabled !== false;
+    const active = user && isAllowedStatus(user.subscription_status) && user.extension_enabled !== false;
 
     if (!active) {
       return res.status(403).json({
@@ -374,40 +286,19 @@ async function requireActiveSession(req, res, next) {
     next();
   } catch (e) {
     console.error('Session check error:', e.message);
-    return res.status(500).json({
-      success: false,
-      active: false,
-      error: 'Server error'
-    });
+    return res.status(500).json({ success: false, active: false, error: 'Server error' });
   }
 }
 
-async function upsertUserFromSubscription({
-  clerkUserId,
-  email,
-  stripeCustomerId,
-  stripeSubscriptionId,
-  status,
-  plan,
-  seatLimit,
-  currentPeriodEnd
-}) {
+async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId, stripeSubscriptionId, status, plan, seatLimit, currentPeriodEnd }) {
   const normalizedEmail = normalizeEmail(email);
   if (!pool || !normalizedEmail) return;
 
   await pool.query(
     `INSERT INTO autopost_users (
-       clerk_user_id,
-       email,
-       stripe_customer_id,
-       stripe_subscription_id,
-       subscription_status,
-       current_period_end,
-       extension_enabled,
-       plan,
-       seat_limit,
-       created_at,
-       updated_at
+       clerk_user_id, email, stripe_customer_id, stripe_subscription_id,
+       subscription_status, current_period_end, extension_enabled, plan, seat_limit,
+       created_at, updated_at
      )
      VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8,NOW(),NOW())
      ON CONFLICT (email)
@@ -421,31 +312,14 @@ async function upsertUserFromSubscription({
        plan = EXCLUDED.plan,
        seat_limit = EXCLUDED.seat_limit,
        updated_at = NOW()`,
-    [
-      clerkUserId || null,
-      normalizedEmail,
-      stripeCustomerId || null,
-      stripeSubscriptionId || null,
-      status || 'inactive',
-      currentPeriodEnd || null,
-      plan || 'solo',
-      seatLimit || 1
-    ]
+    [clerkUserId || null, normalizedEmail, stripeCustomerId || null, stripeSubscriptionId || null, status || 'inactive', currentPeriodEnd || null, plan || 'solo', seatLimit || 1]
   );
 
   if (clerkUserId) {
     await pool.query(
       `INSERT INTO autopost_teams (
-         owner_clerk_user_id,
-         owner_email,
-         stripe_customer_id,
-         stripe_subscription_id,
-         plan,
-         seat_limit,
-         subscription_status,
-         extension_enabled,
-         created_at,
-         updated_at
+         owner_clerk_user_id, owner_email, stripe_customer_id, stripe_subscription_id,
+         plan, seat_limit, subscription_status, extension_enabled, created_at, updated_at
        )
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
        ON CONFLICT (owner_clerk_user_id)
@@ -459,44 +333,17 @@ async function upsertUserFromSubscription({
          extension_enabled = EXCLUDED.extension_enabled,
          updated_at = NOW()
        RETURNING id`,
-      [
-        clerkUserId,
-        normalizedEmail,
-        stripeCustomerId || null,
-        stripeSubscriptionId || null,
-        plan || 'solo',
-        seatLimit || 1,
-        status || 'inactive',
-        isAllowedStatus(status)
-      ]
+      [clerkUserId, normalizedEmail, stripeCustomerId || null, stripeSubscriptionId || null, plan || 'solo', seatLimit || 1, status || 'inactive', isAllowedStatus(status)]
     );
 
-    const team = await pool.query(
-      `SELECT id FROM autopost_teams WHERE owner_clerk_user_id = $1 LIMIT 1`,
-      [clerkUserId]
-    );
-
+    const team = await pool.query(`SELECT id FROM autopost_teams WHERE owner_clerk_user_id = $1 LIMIT 1`, [clerkUserId]);
     const teamId = team.rows[0] && team.rows[0].id;
-
     if (teamId) {
       await pool.query(
-        `INSERT INTO autopost_team_members (
-           team_id,
-           clerk_user_id,
-           email,
-           role,
-           status,
-           created_at,
-           updated_at
-         )
+        `INSERT INTO autopost_team_members (team_id, clerk_user_id, email, role, status, created_at, updated_at)
          VALUES ($1,$2,$3,'owner','active',NOW(),NOW())
          ON CONFLICT (clerk_user_id)
-         DO UPDATE SET
-           team_id = EXCLUDED.team_id,
-           email = EXCLUDED.email,
-           role = 'owner',
-           status = 'active',
-           updated_at = NOW()`,
+         DO UPDATE SET team_id = EXCLUDED.team_id, email = EXCLUDED.email, role = 'owner', status = 'active', updated_at = NOW()`,
         [teamId, clerkUserId, normalizedEmail]
       );
     }
@@ -516,39 +363,26 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       const session = event.data.object;
       const plan = session.metadata && session.metadata.plan === 'team' ? 'team' : 'solo';
       const meta = planMeta(plan);
-
       let subscription = null;
-
       if (session.subscription) {
         subscription = await stripe.subscriptions.retrieve(session.subscription);
       }
-
       await upsertUserFromSubscription({
         clerkUserId: session.metadata && session.metadata.clerkUserId,
-        email:
-          (session.customer_details && session.customer_details.email) ||
-          (session.metadata && session.metadata.email),
+        email: (session.customer_details && session.customer_details.email) || (session.metadata && session.metadata.email),
         stripeCustomerId: session.customer,
         stripeSubscriptionId: session.subscription,
         status: subscription ? subscription.status : 'active',
         plan: meta.plan,
         seatLimit: meta.seatLimit,
-        currentPeriodEnd:
-          subscription && subscription.current_period_end
-            ? new Date(subscription.current_period_end * 1000)
-            : null
+        currentPeriodEnd: subscription && subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null
       });
     }
 
-    if (
-      event.type === 'customer.subscription.created' ||
-      event.type === 'customer.subscription.updated' ||
-      event.type === 'customer.subscription.deleted'
-    ) {
+    if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
       const sub = event.data.object;
-      const plan = sub.metadata && sub.metadata.plan === 'team' ? 'team' : 'solo';
+      const plan = (sub.metadata && sub.metadata.plan === 'team') ? 'team' : 'solo';
       const meta = planMeta(plan);
-
       await upsertUserFromSubscription({
         clerkUserId: sub.metadata && sub.metadata.clerkUserId,
         email: sub.metadata && sub.metadata.email,
@@ -557,30 +391,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         status: event.type === 'customer.subscription.deleted' ? 'canceled' : sub.status,
         plan: meta.plan,
         seatLimit: meta.seatLimit,
-        currentPeriodEnd: sub.current_period_end
-          ? new Date(sub.current_period_end * 1000)
-          : null
+        currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null
       });
     }
 
     if (event.type === 'invoice.payment_failed') {
       const invoice = event.data.object;
-
       if (invoice.subscription && pool) {
         await pool.query(
-          `UPDATE autopost_users
-           SET subscription_status = 'past_due',
-               extension_enabled = false,
-               updated_at = NOW()
+          `UPDATE autopost_users SET subscription_status = 'past_due', extension_enabled = false, updated_at = NOW()
            WHERE stripe_subscription_id = $1`,
           [invoice.subscription]
         );
-
         await pool.query(
-          `UPDATE autopost_teams
-           SET subscription_status = 'past_due',
-               extension_enabled = false,
-               updated_at = NOW()
+          `UPDATE autopost_teams SET subscription_status = 'past_due', extension_enabled = false, updated_at = NOW()
            WHERE stripe_subscription_id = $1`,
           [invoice.subscription]
         );
@@ -601,17 +425,15 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-
   if (req.method === 'OPTIONS') return res.sendStatus(200);
-
   next();
 });
 
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '3.0-neon-stripe-only',
-    auth: 'neon + stripe + clerk metadata',
+    version: '3.1-clerk-extension-handoff',
+    auth: 'clerk website handoff + neon + stripe',
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
     clerkLoaded: !!process.env.CLERK_SECRET_KEY,
@@ -623,7 +445,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '3.0-neon-stripe-only',
+    version: '3.1-clerk-extension-handoff',
     time: new Date().toISOString(),
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -634,32 +456,16 @@ app.get('/health', (req, res) => {
 
 app.get('/api/db-test', async (req, res) => {
   try {
-    if (!pool) {
-      return res.status(500).json({
-        success: false,
-        error: 'DATABASE_URL is missing'
-      });
-    }
-
+    if (!pool) return res.status(500).json({ success: false, error: 'DATABASE_URL is missing' });
     const result = await pool.query('SELECT NOW() AS now');
-
-    return res.json({
-      success: true,
-      databaseConnected: true,
-      time: result.rows[0].now
-    });
+    return res.json({ success: true, databaseConnected: true, time: result.rows[0].now });
   } catch (e) {
-    return res.status(500).json({
-      success: false,
-      databaseConnected: false,
-      error: e.message
-    });
+    return res.status(500).json({ success: false, databaseConnected: false, error: e.message });
   }
 });
 
 app.get('/api/clerk-test', (req, res) => {
   const auth = getAuth(req);
-
   return res.json({
     success: true,
     clerkLoaded: !!process.env.CLERK_SECRET_KEY,
@@ -680,117 +486,28 @@ app.get('/api/stripe-config-test', (req, res) => {
   });
 });
 
-app.post('/api/stripe/create-checkout-session', async (req, res) => {
-  try {
-    if (!stripe) {
-      return res.status(500).json({
-        success: false,
-        error: 'Stripe is not configured'
-      });
-    }
+app.get('/api/public-config', (req, res) => {
+  return res.json({
+    success: true,
+    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY || '',
+    frontendUrl: FRONTEND_URL
+  });
+});
 
+app.post('/api/extension/create-token', async (req, res) => {
+  try {
     const auth = getAuth(req);
 
     if (!auth.isAuthenticated || !auth.userId) {
       return res.status(401).json({
         success: false,
-        error: 'Please sign in first.'
+        error: 'Please sign in with your AutoPost account.'
       });
     }
 
-    const requestedPlan = req.body && req.body.plan === 'team' ? 'team' : 'solo';
-    const meta = planMeta(requestedPlan);
-
-    if (!meta.priceId) {
-      return res.status(500).json({
-        success: false,
-        error: 'Stripe price is missing for plan.'
-      });
-    }
-
-    const email = normalizeEmail(req.body.email || '');
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price: meta.priceId,
-          quantity: 1
-        }
-      ],
-      success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/pricing`,
-      customer_email: email || undefined,
-      metadata: {
-        clerkUserId: auth.userId,
-        email,
-        plan: meta.plan,
-        seatLimit: String(meta.seatLimit)
-      },
-      subscription_data: {
-        metadata: {
-          clerkUserId: auth.userId,
-          email,
-          plan: meta.plan,
-          seatLimit: String(meta.seatLimit)
-        }
-      }
-    });
-
-    return res.json({
-      success: true,
-      url: session.url
-    });
-  } catch (e) {
-    console.error('Checkout session error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      error: 'Could not create checkout session'
-    });
-  }
-});
-
-app.post('/login', async (req, res) => {
-  try {
-    const { username, password, deviceId } = req.body || {};
-    const email = normalizeEmail(username);
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-
-    const limited = rateLimitLogin(email, ip);
-
-    if (!limited.allowed) {
-      return res.status(429).json({
-        success: false,
-        error: limited.error
-      });
-    }
-
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'Enter email and password'
-      });
-    }
-
-    const user = await findAccessByEmail(email);
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Account not found. Create an AutoPost account first.'
-      });
-    }
-
-    if (!verifyPassword(password, user.password_salt, user.password_hash)) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid email or password'
-      });
-    }
-
+    const user = await findAccessByClerkUserId(auth.userId);
     const active =
+      user &&
       isAllowedStatus(user.subscription_status) &&
       user.extension_enabled !== false;
 
@@ -799,6 +516,97 @@ app.post('/login', async (req, res) => {
         success: false,
         error: 'No active subscription. Visit tryautopost.com to subscribe.'
       });
+    }
+
+    const token = createSessionToken({
+      clerkUserId: auth.userId,
+      email: user.email || '',
+      deviceId: req.body && req.body.deviceId
+    });
+
+    return res.json({
+      success: true,
+      token,
+      expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
+      user: publicUser(user)
+    });
+  } catch (e) {
+    console.error('Extension token error:', e.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Could not connect extension.'
+    });
+  }
+});
+
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ success: false, error: 'Stripe is not configured' });
+    const auth = getAuth(req);
+    if (!auth.isAuthenticated || !auth.userId) {
+      return res.status(401).json({ success: false, error: 'Please sign in first.' });
+    }
+
+    const requestedPlan = req.body && req.body.plan === 'team' ? 'team' : 'solo';
+    const meta = planMeta(requestedPlan);
+    if (!meta.priceId) return res.status(500).json({ success: false, error: 'Stripe price is missing for plan.' });
+
+    const email = normalizeEmail(req.body.email || '');
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: meta.priceId, quantity: 1 }],
+      success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/pricing`,
+      customer_email: email || undefined,
+      metadata: {
+        clerkUserId: auth.userId,
+        email: email,
+        plan: meta.plan,
+        seatLimit: String(meta.seatLimit)
+      },
+      subscription_data: {
+        metadata: {
+          clerkUserId: auth.userId,
+          email: email,
+          plan: meta.plan,
+          seatLimit: String(meta.seatLimit)
+        }
+      }
+    });
+
+    return res.json({ success: true, url: session.url });
+  } catch (e) {
+    console.error('Checkout session error:', e.message);
+    return res.status(500).json({ success: false, error: 'Could not create checkout session' });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  try {
+    const { username, password, deviceId } = req.body || {};
+    const email = normalizeEmail(username);
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const limited = rateLimitLogin(email, ip);
+    if (!limited.allowed) return res.status(429).json({ success: false, error: limited.error });
+
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Enter email and password' });
+    }
+
+    const user = await findAccessByEmail(email);
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Account not found. Create an AutoPost account first.' });
+    }
+
+    if (!verifyPassword(password, user.password_salt, user.password_hash)) {
+      return res.status(401).json({ success: false, error: 'Invalid email or password' });
+    }
+
+    const active = isAllowedStatus(user.subscription_status) && user.extension_enabled !== false;
+    if (!active) {
+      return res.status(403).json({ success: false, error: 'No active subscription. Visit tryautopost.com to subscribe.' });
     }
 
     const token = createSessionToken({
@@ -815,26 +623,16 @@ app.post('/login', async (req, res) => {
     });
   } catch (e) {
     console.error('Login error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 app.post('/verify-session', requireActiveSession, async (req, res) => {
-  return res.json({
-    success: true,
-    active: true,
-    user: publicUser(req.user)
-  });
+  return res.json({ success: true, active: true, user: publicUser(req.user) });
 });
 
 app.post('/logout', (req, res) => {
-  return res.json({
-    success: true
-  });
+  return res.json({ success: true });
 });
 
 app.get('/api/extension/access', async (req, res) => {
@@ -845,30 +643,20 @@ app.get('/api/extension/access', async (req, res) => {
 
     if (bearer && bearer.includes('.')) {
       const verified = verifySessionToken(bearer);
-      if (verified.valid) {
-        user = await findAccessFromSession(verified.session);
-      }
+      if (verified.valid) user = await findAccessFromSession(verified.session);
     }
 
     if (!user) {
       const auth = getAuth(req);
-      if (auth.isAuthenticated && auth.userId) {
-        user = await findAccessByClerkUserId(auth.userId);
-      }
+      if (auth.isAuthenticated && auth.userId) user = await findAccessByClerkUserId(auth.userId);
     }
 
     if (!user) {
-      return res.status(401).json({
-        allowed: false,
-        status: 'unauthenticated',
-        error: 'Please sign in.'
-      });
+      return res.status(401).json({ allowed: false, status: 'unauthenticated', error: 'Please sign in.' });
     }
 
     const status = String(user.subscription_status || 'inactive').toLowerCase();
-    const allowed =
-      user.extension_enabled !== false &&
-      isAllowedStatus(status);
+    const allowed = user.extension_enabled !== false && isAllowedStatus(status);
 
     return res.json({
       allowed,
@@ -881,31 +669,20 @@ app.get('/api/extension/access', async (req, res) => {
     });
   } catch (e) {
     console.error('Extension access error:', e.message);
-
-    return res.status(500).json({
-      allowed: false,
-      status: 'server_error',
-      error: 'Server error'
-    });
+    return res.status(500).json({ allowed: false, status: 'server_error', error: 'Server error' });
   }
 });
 
 app.post('/describe', requireActiveSession, async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) {
-      return res.status(501).json({
-        success: false,
-        error: 'AI description service is not configured'
-      });
+      return res.status(501).json({ success: false, error: 'AI description service is not configured' });
     }
 
     const { vehicle = {}, settings = {} } = req.body || {};
-
     const extra = String(settings.aiInstructions || '').trim();
     const dealerText = String(vehicle.dealerDescription || '').slice(0, 2000);
-    const mileage = vehicle.mileage
-      ? Number(vehicle.mileage).toLocaleString() + ' miles'
-      : '';
+    const mileage = vehicle.mileage ? Number(vehicle.mileage).toLocaleString() + ' miles' : '';
 
     const prompt = `You are writing a Facebook Marketplace car listing. Use this exact format:
 
@@ -947,50 +724,27 @@ Write the listing now.`;
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 500,
-        messages: [
-          {
-            role: 'user',
-            content: prompt
-          }
-        ]
+        messages: [{ role: 'user', content: prompt }]
       })
     });
 
     if (!aiRes.ok) {
       const errText = await aiRes.text();
       console.error('Anthropic error:', aiRes.status, errText.slice(0, 500));
-
-      return res.status(502).json({
-        success: false,
-        error: 'AI description failed'
-      });
+      return res.status(502).json({ success: false, error: 'AI description failed' });
     }
 
     const data = await aiRes.json();
-    const description =
-      data.content && data.content[0]
-        ? data.content[0].text.trim()
-        : '';
-
-    return res.json({
-      success: true,
-      description
-    });
+    const description = data.content && data.content[0] ? data.content[0].text.trim() : '';
+    return res.json({ success: true, description });
   } catch (e) {
     console.error('Describe error:', e.message);
-
-    return res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 app.use((req, res) => {
-  return res.status(404).json({
-    success: false,
-    error: 'Route not found'
-  });
+  return res.status(404).json({ success: false, error: 'Route not found' });
 });
 
 initDb()
