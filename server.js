@@ -432,7 +432,7 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '3.1-clerk-extension-handoff',
+    version: '3.2-signup-checkout-fix',
     auth: 'clerk website handoff + neon + stripe',
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -445,7 +445,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '3.1-clerk-extension-handoff',
+    version: '3.2-signup-checkout-fix',
     time: new Date().toISOString(),
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -494,6 +494,52 @@ app.get('/api/public-config', (req, res) => {
   });
 });
 
+// Website signup: create account with email + password
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body && req.body.email);
+    const password = String((req.body && req.body.password) || '').trim();
+
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters.' });
+    }
+    if (!pool) {
+      return res.status(500).json({ success: false, error: 'Database not configured.' });
+    }
+
+    const existing = await findAccessByEmail(email);
+    if (existing && existing.password_hash) {
+      return res.status(400).json({ success: false, error: 'An account with that email already exists.' });
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPassword(password, salt);
+
+    if (existing) {
+      // Account exists (e.g. created via webhook) but no password yet — add credentials
+      await pool.query(
+        `UPDATE autopost_users SET password_salt = $1, password_hash = $2, updated_at = NOW() WHERE LOWER(email) = $3`,
+        [salt, hash, email]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO autopost_users
+           (email, password_salt, password_hash, subscription_status, extension_enabled, plan, seat_limit, created_at, updated_at)
+         VALUES ($1, $2, $3, 'inactive', false, 'solo', 1, NOW(), NOW())`,
+        [email, salt, hash]
+      );
+    }
+
+    return res.json({ success: true, email });
+  } catch (e) {
+    console.error('Signup error:', e.message);
+    return res.status(500).json({ success: false, error: 'Server error during signup.' });
+  }
+});
+
 app.post('/api/extension/create-token', async (req, res) => {
   try {
     const auth = getAuth(req);
@@ -539,36 +585,40 @@ app.post('/api/extension/create-token', async (req, res) => {
   }
 });
 
+// Create Stripe checkout — works with email/password signup (no Clerk required)
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ success: false, error: 'Stripe is not configured' });
-    const auth = getAuth(req);
-    if (!auth.isAuthenticated || !auth.userId) {
-      return res.status(401).json({ success: false, error: 'Please sign in first.' });
-    }
 
     const requestedPlan = req.body && req.body.plan === 'team' ? 'team' : 'solo';
     const meta = planMeta(requestedPlan);
     if (!meta.priceId) return res.status(500).json({ success: false, error: 'Stripe price is missing for plan.' });
 
-    const email = normalizeEmail(req.body.email || '');
+    const email = normalizeEmail((req.body && req.body.email) || '');
+
+    // Try Clerk auth if available, fall back gracefully
+    let clerkUserId = null;
+    try {
+      const auth = getAuth(req);
+      if (auth && auth.isAuthenticated && auth.userId) clerkUserId = auth.userId;
+    } catch (_) {}
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       payment_method_types: ['card'],
       line_items: [{ price: meta.priceId, quantity: 1 }],
       success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/pricing`,
+      cancel_url: `${FRONTEND_URL}/#pricing`,
       customer_email: email || undefined,
       metadata: {
-        clerkUserId: auth.userId,
+        clerkUserId: clerkUserId || '',
         email: email,
         plan: meta.plan,
         seatLimit: String(meta.seatLimit)
       },
       subscription_data: {
         metadata: {
-          clerkUserId: auth.userId,
+          clerkUserId: clerkUserId || '',
           email: email,
           plan: meta.plan,
           seatLimit: String(meta.seatLimit)
