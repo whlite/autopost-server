@@ -22,6 +22,7 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const STRIPE_PRICE_SOLO = process.env.STRIPE_PRICE_SOLO || '';
 const STRIPE_PRICE_TEAM = process.env.STRIPE_PRICE_TEAM || '';
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://tryautopost.com').replace(/\/$/, '');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 const pool = DATABASE_URL
@@ -41,8 +42,10 @@ console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
 console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
 console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
 console.log('STRIPE_SECRET_KEY loaded:', !!STRIPE_SECRET_KEY);
+console.log('STRIPE_WEBHOOK_SECRET loaded:', !!STRIPE_WEBHOOK_SECRET);
 console.log('STRIPE_PRICE_SOLO loaded:', !!STRIPE_PRICE_SOLO);
 console.log('STRIPE_PRICE_TEAM loaded:', !!STRIPE_PRICE_TEAM);
+console.log('ADMIN_SECRET loaded:', !!ADMIN_SECRET);
 console.log('PORT:', PORT);
 
 function now() {
@@ -292,7 +295,10 @@ async function requireActiveSession(req, res, next) {
 
 async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId, stripeSubscriptionId, status, plan, seatLimit, currentPeriodEnd }) {
   const normalizedEmail = normalizeEmail(email);
-  if (!pool || !normalizedEmail) return;
+  if (!pool || !normalizedEmail) {
+    console.error('upsertUserFromSubscription: missing pool or email', { hasPool: !!pool, email });
+    return;
+  }
 
   await pool.query(
     `INSERT INTO autopost_users (
@@ -314,6 +320,8 @@ async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId
        updated_at = NOW()`,
     [clerkUserId || null, normalizedEmail, stripeCustomerId || null, stripeSubscriptionId || null, status || 'inactive', currentPeriodEnd || null, plan || 'solo', seatLimit || 1]
   );
+
+  console.log('upsertUserFromSubscription: updated', normalizedEmail, 'status:', status);
 
   if (clerkUserId) {
     await pool.query(
@@ -353,11 +361,20 @@ async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+      console.error('Stripe webhook hit but not configured. stripe:', !!stripe, 'secret:', !!STRIPE_WEBHOOK_SECRET);
       return res.status(500).send('Stripe webhook not configured');
     }
 
     const sig = req.headers['stripe-signature'];
-    const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (sigErr) {
+      console.error('Stripe webhook signature verification failed:', sigErr.message);
+      return res.status(400).send(`Webhook Error: ${sigErr.message}`);
+    }
+
+    console.log('Stripe webhook received:', event.type);
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
@@ -367,9 +384,11 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       if (session.subscription) {
         subscription = await stripe.subscriptions.retrieve(session.subscription);
       }
+      const resolvedEmail = (session.customer_details && session.customer_details.email) || (session.metadata && session.metadata.email);
+      console.log('checkout.session.completed for', resolvedEmail, 'subscription status:', subscription ? subscription.status : 'active (no sub object)');
       await upsertUserFromSubscription({
         clerkUserId: session.metadata && session.metadata.clerkUserId,
-        email: (session.customer_details && session.customer_details.email) || (session.metadata && session.metadata.email),
+        email: resolvedEmail,
         stripeCustomerId: session.customer,
         stripeSubscriptionId: session.subscription,
         status: subscription ? subscription.status : 'active',
@@ -383,6 +402,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       const sub = event.data.object;
       const plan = (sub.metadata && sub.metadata.plan === 'team') ? 'team' : 'solo';
       const meta = planMeta(plan);
+      console.log(event.type, 'for', sub.metadata && sub.metadata.email, 'status:', sub.status);
       await upsertUserFromSubscription({
         clerkUserId: sub.metadata && sub.metadata.clerkUserId,
         email: sub.metadata && sub.metadata.email,
@@ -432,7 +452,7 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '3.2-signup-checkout-fix',
+    version: '3.3-admin-activate',
     auth: 'clerk website handoff + neon + stripe',
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -445,7 +465,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '3.2-signup-checkout-fix',
+    version: '3.3-admin-activate',
     time: new Date().toISOString(),
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -630,6 +650,65 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
   } catch (e) {
     console.error('Checkout session error:', e.message);
     return res.status(500).json({ success: false, error: 'Could not create checkout session' });
+  }
+});
+
+// Admin: manually activate / sync a user's subscription (for fixing missed webhooks)
+app.post('/api/admin/activate', async (req, res) => {
+  try {
+    const provided = req.headers['x-admin-secret'] || (req.body && req.body.adminSecret);
+    if (!ADMIN_SECRET || !safeEqual(provided, ADMIN_SECRET)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    if (!pool) return res.status(500).json({ success: false, error: 'Database not configured.' });
+
+    const email = normalizeEmail(req.body && req.body.email);
+    if (!email) return res.status(400).json({ success: false, error: 'Email required' });
+
+    const plan = (req.body && req.body.plan === 'team') ? 'team' : 'solo';
+    const meta = planMeta(plan);
+
+    let stripeCustomerId = null;
+    let stripeSubscriptionId = null;
+    let status = 'active';
+    let currentPeriodEnd = null;
+
+    // If Stripe is configured, look up the customer/subscription by email to sync real data
+    if (stripe) {
+      try {
+        const customers = await stripe.customers.list({ email, limit: 1 });
+        const customer = customers.data[0];
+        if (customer) {
+          stripeCustomerId = customer.id;
+          const subs = await stripe.subscriptions.list({ customer: customer.id, limit: 1, status: 'all' });
+          const sub = subs.data[0];
+          if (sub) {
+            stripeSubscriptionId = sub.id;
+            status = sub.status;
+            currentPeriodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+          }
+        }
+      } catch (stripeErr) {
+        console.error('Admin activate: Stripe lookup failed:', stripeErr.message);
+      }
+    }
+
+    await upsertUserFromSubscription({
+      clerkUserId: null,
+      email,
+      stripeCustomerId,
+      stripeSubscriptionId,
+      status,
+      plan: meta.plan,
+      seatLimit: meta.seatLimit,
+      currentPeriodEnd
+    });
+
+    const user = await findAccessByEmail(email);
+    return res.json({ success: true, user: publicUser(user) });
+  } catch (e) {
+    console.error('Admin activate error:', e.message);
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
