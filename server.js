@@ -588,7 +588,7 @@ app.post('/api/extension/create-token', async (req, res) => {
     // Clerk lookup misses, resolve the user's VERIFIED email from Clerk (never a
     // client-supplied value) and bridge to the email-keyed record. Runs ONLY on a
     // miss, so the existing working path is completely untouched.
-    if (!user || !isAllowedStatus(user.subscription_status)) {
+    if (!user || !isAllowedStatus(user.subscription_status) || user.extension_enabled === false) {
       let verifiedEmail = '';
       try {
         const cu = await clerkClient.users.getUser(auth.userId);
@@ -624,7 +624,7 @@ app.post('/api/extension/create-token', async (req, res) => {
 
         // (2) Owner allowlist: force-activate emails in MANUAL_ACTIVE_EMAILS, even
         //     with no Stripe record. Lets the owner grant access via one env var.
-        if ((!user || !isAllowedStatus(user.subscription_status)) && MANUAL_ACTIVE_EMAILS.includes(verifiedEmail)) {
+        if ((!user || !isAllowedStatus(user.subscription_status) || user.extension_enabled === false) && MANUAL_ACTIVE_EMAILS.includes(verifiedEmail)) {
           await upsertUserFromSubscription({
             clerkUserId: auth.userId,
             email: verifiedEmail,
