@@ -1,156 +1,6 @@
-const express = require('express');
-const fetch = require('node-fetch');
-const crypto = require('crypto');
-const { Pool } = require('pg');
-const Stripe = require('stripe');
-const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
-
-const app = express();
-
-const PORT = process.env.PORT || 8080;
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const ANTHROPIC_API_KEY =
-  process.env.ANTHROPIC_API_KEY ||
-  process.env.CLAUDE_API_KEY ||
-  process.env.ANTHROPIC_KEY ||
-  process.env.CLAUDE_KEY;
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  'temporary-autopost-session-secret-change-this-in-railway-very-long-2026';
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
-const STRIPE_PRICE_SOLO = process.env.STRIPE_PRICE_SOLO || '';
-const STRIPE_PRICE_TEAM = process.env.STRIPE_PRICE_TEAM || '';
-const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://tryautopost.com').replace(/\/$/, '');
-const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
-// v4.19: Owner-controlled manual access allowlist. Comma-separated emails set in
-// Railway (MANUAL_ACTIVE_EMAILS) are granted active access on sign-in even with
-// no Stripe record. No secret or DB console required: set the env var and the
-// user is in on their next connect.
-const MANUAL_ACTIVE_EMAILS = String(process.env.MANUAL_ACTIVE_EMAILS || '')
-  .split(',').map(function(e){ return e.trim().toLowerCase(); }).filter(Boolean);
-
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
-    })
-  : null;
-
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
-const loginAttempts = new Map();
-
-console.log('AutoPost booting...');
-console.log('DATABASE_URL loaded:', !!DATABASE_URL);
-console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
-console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
-console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
-console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
-console.log('STRIPE_SECRET_KEY loaded:', !!STRIPE_SECRET_KEY);
-console.log('STRIPE_WEBHOOK_SECRET loaded:', !!STRIPE_WEBHOOK_SECRET);
-console.log('STRIPE_PRICE_SOLO loaded:', !!STRIPE_PRICE_SOLO);
-console.log('STRIPE_PRICE_TEAM loaded:', !!STRIPE_PRICE_TEAM);
-console.log('ADMIN_SECRET loaded:', !!ADMIN_SECRET);
-console.log('PORT:', PORT);
-
-function now() {
-  return Date.now();
-}
-
-function normalizeEmail(email) {
-  return String(email || '').toLowerCase().trim();
-}
-
-function safeEqual(a, b) {
-  const aString = String(a || '');
-  const bString = String(b || '');
-  const aBuf = Buffer.from(aString);
-  const bBuf = Buffer.from(bString);
-  if (aBuf.length !== bBuf.length) return false;
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
-
-function hashPassword(password, salt) {
-  return crypto
-    .createHash('sha256')
-    .update(String(salt || '') + ':' + String(password || ''))
-    .digest('hex');
-}
-
-function verifyPassword(password, salt, storedHash) {
-  if (!salt || !storedHash) return false;
-  const incoming = hashPassword(password, salt);
-  return safeEqual(incoming, storedHash);
-}
-
-function rateLimitLogin(email, ip) {
-  const key = `${ip}:${normalizeEmail(email)}`;
-  const existing = loginAttempts.get(key) || { count: 0, firstAttempt: now() };
-  const windowMs = 1000 * 60 * 10;
-  if (now() - existing.firstAttempt > windowMs) {
-    loginAttempts.set(key, { count: 1, firstAttempt: now() });
-    return { allowed: true };
-  }
-  existing.count += 1;
-  loginAttempts.set(key, existing);
-  if (existing.count > 10) {
-    return { allowed: false, error: 'Too many login attempts. Try again later.' };
-  }
-  return { allowed: true };
-}
-
-function createSessionToken(payload) {
-  const session = {
-    clerkUserId: String(payload.clerkUserId || ''),
-    email: normalizeEmail(payload.email),
-    deviceId: String(payload.deviceId || ''),
-    issuedAt: now(),
-    expiresAt: now() + SESSION_TTL_MS
-  };
-  const body = Buffer.from(JSON.stringify(session)).toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
-  return `${body}.${sig}`;
-}
-
-function verifySessionToken(token) {
-  if (!token || typeof token !== 'string' || !token.includes('.')) {
-    return { valid: false, error: 'Missing token' };
-  }
-  const parts = token.split('.');
-  if (parts.length !== 2) return { valid: false, error: 'Invalid token format' };
-  const [body, sig] = parts;
-  if (!body || !sig) return { valid: false, error: 'Invalid token format' };
-  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
-  if (!safeEqual(sig, expectedSig)) return { valid: false, error: 'Invalid token signature' };
-  let session;
-  try {
-    session = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-  } catch (e) {
-    return { valid: false, error: 'Invalid token body' };
-  }
-  if (!session.expiresAt || now() > session.expiresAt) {
-    return { valid: false, error: 'Session expired' };
-  }
-  return { valid: true, session };
-}
-
-function isAllowedStatus(status) {
-  const s = String(status || '').toLowerCase();
-  return s === 'active' || s === 'trialing';
-}
-
-function planMeta(plan) {
-  if (plan === 'team') return { plan: 'team', seatLimit: 3, priceId: STRIPE_PRICE_TEAM };
-  return { plan: 'solo', seatLimit: 1, priceId: STRIPE_PRICE_SOLO };
-}
-
-function publicUser(user) {
-  return {
-    username: user.email,
-    email: user.email,
-    clerkUserId: user.clerk_user_id || '',
-    active: isAllowedStatus(user.subscription_status) && user.extension_enabled !== false,
+const active =
+      user &&
+      isAllowedStatus(user.subscription_status);
     plan: user.plan || 'solo',
     subscriptionStatus: user.subscription_status || 'inactive',
     deviceLimit: user.seat_limit || 1
@@ -280,7 +130,7 @@ async function requireActiveSession(req, res, next) {
     }
 
     const user = await findAccessFromSession(verified.session);
-    const active = user && isAllowedStatus(user.subscription_status) && user.extension_enabled !== false;
+    const active = user && isAllowedStatus(user.subscription_status);
 
     if (!active) {
       return res.status(403).json({
@@ -641,8 +491,7 @@ app.post('/api/extension/create-token', async (req, res) => {
 
     const active =
       user &&
-      isAllowedStatus(user.subscription_status) &&
-      user.extension_enabled !== false;
+      isAllowedStatus(user.subscription_status);
 
     if (!active) {
       return res.status(403).json({
@@ -800,7 +649,7 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const active = isAllowedStatus(user.subscription_status) && user.extension_enabled !== false;
+    const active = isAllowedStatus(user.subscription_status);
     if (!active) {
       return res.status(403).json({ success: false, error: 'No active subscription. Visit tryautopost.com to subscribe.' });
     }
