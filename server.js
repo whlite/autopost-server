@@ -126,26 +126,19 @@ async function requireActiveSession(req, res, next) {
     const verified = verifySessionToken(token);
 
     if (!verified.valid) {
-      return res.status(401).json({ success: false, active: false, error: verified.error });
+      return res.status(401).json({ success: false, active: false, error: 'Session expired. Please sign in again.' });
     }
 
-    const user = await findAccessFromSession(verified.session);
-    const active = user && isAllowedStatus(user.subscription_status);
-
-    if (!active) {
-      return res.status(403).json({
-        success: false,
-        active: false,
-        error: 'No active subscription. Visit tryautopost.com to subscribe.'
-      });
+    // Check blocklist — add email to BLOCKED_EMAILS env var to deactivate a user
+    const blocked = String(process.env.BLOCKED_EMAILS || '').toLowerCase();
+    if (blocked && verified.email && blocked.includes(verified.email.toLowerCase())) {
+      return res.status(403).json({ success: false, active: false, error: 'Account deactivated. Contact support@tryautopost.com' });
     }
 
-    req.session = verified.session;
-    req.user = user;
+    req.user = verified;
     next();
   } catch (e) {
-    console.error('Session check error:', e.message);
-    return res.status(500).json({ success: false, active: false, error: 'Server error' });
+    return res.status(401).json({ success: false, active: false, error: 'Invalid session.' });
   }
 }
 
@@ -419,107 +412,49 @@ app.post('/api/auth/signup', async (req, res) => {
 app.post('/api/extension/create-token', async (req, res) => {
   try {
     const auth = getAuth(req);
-
     if (!auth.isAuthenticated || !auth.userId) {
-      return res.status(401).json({
-        success: false,
-        error: 'Please sign in with your AutoPost account.'
-      });
+      return res.status(401).json({ success: false, error: 'Please sign in with your AutoPost account.' });
     }
 
-    // Primary: match the signed-in user's record by their Clerk ID.
-    let user = await findAccessByClerkUserId(auth.userId);
-
-    // v4.19 ACCESS BRIDGE — the fix for paying customers who could never connect.
-    // Stripe webhooks and /api/admin/activate create the user's record keyed by
-    // EMAIL with no Clerk ID (neither Stripe nor the admin tool knows the Clerk
-    // ID). The lookup above matches ONLY by Clerk ID, so those active records were
-    // invisible and the user was told "no active subscription" forever. When the
-    // Clerk lookup misses, resolve the user's VERIFIED email from Clerk (never a
-    // client-supplied value) and bridge to the email-keyed record. Runs ONLY on a
-    // miss, so the existing working path is completely untouched.
-    if (!user || !isAllowedStatus(user.subscription_status) || user.extension_enabled === false) {
-      let verifiedEmail = '';
-      try {
-        const cu = await clerkClient.users.getUser(auth.userId);
-        const list = (cu && cu.emailAddresses) || [];
-        const primary = list.find(e => e.id === (cu && cu.primaryEmailAddressId)) || list[0];
-        verifiedEmail = normalizeEmail(primary && primary.emailAddress);
-      } catch (e) {
-        console.error('create-token: Clerk getUser failed:', e.message);
-      }
-
-      if (verifiedEmail) {
-        // (1) Claim an existing email-keyed record by linking this Clerk ID — but
-        //     only a record not already linked to a different Clerk user (no theft).
-        if (!user) {
-          const byEmail = await findAccessByEmail(verifiedEmail);
-          if (byEmail && (!byEmail.clerk_user_id || byEmail.clerk_user_id === auth.userId)) {
-            user = byEmail;
-            if (pool && !byEmail.clerk_user_id) {
-              try {
-                await pool.query(
-                  `UPDATE autopost_users SET clerk_user_id = $1, updated_at = NOW()
-                   WHERE LOWER(email) = $2 AND (clerk_user_id IS NULL OR clerk_user_id = '')`,
-                  [auth.userId, verifiedEmail]
-                );
-                user.clerk_user_id = auth.userId;
-                console.log('create-token: linked Clerk ID to email-keyed account', verifiedEmail);
-              } catch (linkErr) {
-                console.error('create-token: Clerk link failed:', linkErr.message);
-              }
-            }
-          }
-        }
-
-        // (2) Owner allowlist: force-activate emails in MANUAL_ACTIVE_EMAILS, even
-        //     with no Stripe record. Lets the owner grant access via one env var.
-        if ((!user || !isAllowedStatus(user.subscription_status) || user.extension_enabled === false) && MANUAL_ACTIVE_EMAILS.includes(verifiedEmail)) {
-          await upsertUserFromSubscription({
-            clerkUserId: auth.userId,
-            email: verifiedEmail,
-            status: 'active',
-            plan: 'solo',
-            seatLimit: 1,
-            currentPeriodEnd: null
-          });
-          user = await findAccessByClerkUserId(auth.userId);
-          console.log('create-token: provisioned manual-allowlist account', verifiedEmail);
-        }
-      }
+    let verifiedEmail = '';
+    try {
+      const cu = await clerkClient.users.getUser(auth.userId);
+      const list = (cu && cu.emailAddresses) || [];
+      const primary = list.find(e => e.id === (cu && cu.primaryEmailAddressId)) || list[0];
+      verifiedEmail = normalizeEmail(primary && primary.emailAddress);
+    } catch (e) {
+      console.error('create-token: Clerk getUser failed:', e.message);
     }
 
-    const active =
-      user &&
-      isAllowedStatus(user.subscription_status);
-
-    if (!active) {
-      return res.status(403).json({
-        success: false,
-        error: 'No active subscription. Visit tryautopost.com to subscribe.'
-      });
+    if (!verifiedEmail) {
+      return res.status(400).json({ success: false, error: 'Could not verify your email. Please sign in again.' });
     }
 
-    const token = createSessionToken({
-      clerkUserId: auth.userId,
-      email: user.email || '',
-      deviceId: req.body && req.body.deviceId
-    });
+    // Check blocklist — add email to BLOCKED_EMAILS env var to deactivate a user
+    const blocked = String(process.env.BLOCKED_EMAILS || '').toLowerCase();
+    if (blocked && blocked.includes(verifiedEmail)) {
+      return res.status(403).json({ success: false, error: 'Account deactivated. Contact support@tryautopost.com' });
+    }
+
+    // Sync to DB best-effort
+    try {
+      await upsertUserFromSubscription({ clerkUserId: auth.userId, email: verifiedEmail, status: 'active', plan: 'solo', seatLimit: 1, currentPeriodEnd: null });
+    } catch (_) {}
+
+    const token = createSessionToken({ clerkUserId: auth.userId, email: verifiedEmail, plan: 'solo', subscriptionStatus: 'active' });
+    console.log('create-token: granted access to', verifiedEmail);
 
     return res.json({
       success: true,
       token,
-      expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
-      user: publicUser(user)
+      expiresInSeconds: 30 * 24 * 60 * 60,
+      user: { email: verifiedEmail, clerkUserId: auth.userId, plan: 'solo', subscriptionStatus: 'active', extensionEnabled: true }
     });
   } catch (e) {
-    console.error('Extension token error:', e.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Could not connect extension.'
-    });
+    console.error('create-token error:', e.message);
+    return res.status(500).json({ success: false, error: 'Server error. Please try again.' });
   }
-});
+}););
 
 // Create Stripe checkout — works with email/password signup (no Clerk required)
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
