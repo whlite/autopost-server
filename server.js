@@ -609,7 +609,7 @@ app.post('/api/extension/create-token', async (req, res) => {
     console.error('create-token error:', e.message);
     return res.status(500).json({ success: false, error: 'Server error. Please try again.' });
   }
-}););
+});
 
 // Create Stripe checkout — works with email/password signup (no Clerk required)
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
