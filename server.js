@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const Stripe = require('stripe');
 const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
+const createTeams = require('./teams');
 
 const app = express();
 
@@ -162,6 +163,18 @@ function publicUser(user) {
   };
 }
 
+// AutoPost Teams (ap_* namespace). Additive only — the billing tables below and
+// every existing route behave exactly as they did before. A Solo user's requests
+// pass through one indexed SELECT that returns zero rows.
+const teams = createTeams({
+  pool,
+  verifySessionToken,
+  getAuth,
+  normalizeEmail,
+  safeEqual,
+  adminSecret: ADMIN_SECRET
+});
+
 async function initDb() {
   if (!pool) {
     console.log('Database not configured.');
@@ -221,6 +234,14 @@ async function initDb() {
   `);
 
   console.log('Database ready: Neon tables checked.');
+
+  // Teams schema is created after the core tables and is independent of them.
+  // A failure here must never stop the server from booting and serving Solo.
+  try {
+    await teams.initTeamsSchema();
+  } catch (e) {
+    console.error('Teams schema init failed (Solo unaffected):', e.message);
+  }
 }
 
 async function findAccessByEmail(email) {
@@ -452,6 +473,11 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
+
+// AutoPost Teams routes. Mounted after express.json + clerkMiddleware + CORS so
+// team routes see a parsed body and a resolved Clerk session, and before the 404
+// handler at the bottom of this file.
+app.use(teams.router);
 
 app.get('/', (req, res) => {
   res.json({
