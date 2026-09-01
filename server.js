@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const Stripe = require('stripe');
 const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
 const createTeams = require('./teams');
+const createNotify = require('./notify');
 
 const app = express();
 
@@ -175,6 +176,16 @@ const teams = createTeams({
   adminSecret: ADMIN_SECRET
 });
 
+// Signup alerts (ap_leads namespace). Records every new dealership and texts /
+// emails the owner on a repeating timer until it is explicitly acknowledged.
+// Additive and isolated: every failure inside it is logged and swallowed, so it
+// can never stop a sign-in, a checkout, or a post.
+const notify = createNotify({
+  pool,
+  safeEqual,
+  adminSecret: ADMIN_SECRET
+});
+
 async function initDb() {
   if (!pool) {
     console.log('Database not configured.');
@@ -234,6 +245,14 @@ async function initDb() {
   `);
 
   console.log('Database ready: Neon tables checked.');
+
+  // Signup-alert schema. Same rule as Teams: a failure here must never stop the
+  // server from booting and serving customers.
+  try {
+    await notify.initSchema();
+  } catch (e) {
+    console.error('Notify schema error (server continues):', e.message);
+  }
 
   // Teams schema is created after the core tables and is independent of them.
   // A failure here must never stop the server from booting and serving Solo.
@@ -421,6 +440,17 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         seatLimit: meta.seatLimit,
         currentPeriodEnd: subscription && subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null
       });
+
+      // Alert on the payment itself, so a paid signup reaches you even if the
+      // dealer never fills in the setup form. If they do submit it later,
+      // captureLead() merges into this same row instead of alerting twice.
+      notify.captureLead({
+        email: resolvedEmail,
+        name: session.customer_details && session.customer_details.name,
+        phone: session.customer_details && session.customer_details.phone,
+        source: 'stripe',
+        notes: 'Paid ' + meta.plan + ' plan. Setup form not submitted yet.'
+      }).catch(function (e) { console.error('Notify capture (stripe) error:', e.message); });
     }
 
     if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
@@ -478,6 +508,10 @@ app.use((req, res, next) => {
 // team routes see a parsed body and a resolved Clerk session, and before the 404
 // handler at the bottom of this file.
 app.use(teams.router);
+
+// Signup alert routes: POST /api/lead, the acknowledgement page, and the Twilio
+// inbound-SMS hook. Same middleware position as Teams.
+app.use(notify.router);
 
 app.get('/', (req, res) => {
   res.json({
@@ -912,6 +946,7 @@ initDb()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`AutoPost running on port ${PORT}`);
+      notify.startEscalation();
     });
   })
   .catch((e) => {
