@@ -6,6 +6,7 @@ const Stripe = require('stripe');
 const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
 const createTeams = require('./teams');
 const createNotify = require('./notify');
+const createOperator = require('./operator');
 
 const app = express();
 
@@ -36,7 +37,8 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
+      // Neon needs TLS; a local test database does not have it.
+      ssl: (DATABASE_URL.includes('@localhost') || DATABASE_URL.includes('@127.0.0.1')) ? false : { rejectUnauthorized: false }
     })
   : null;
 
@@ -194,6 +196,10 @@ const notify = createNotify({
   safeEqual,
   adminSecret: ADMIN_SECRET
 });
+
+// Owner maintenance routes (billing reconcile, schema view). They run inside
+// Railway so production secrets never leave it. Operator-key protected.
+const operator = createOperator({ pool, stripe });
 
 async function initDb() {
   if (!pool) {
@@ -557,10 +563,13 @@ app.use(teams.router);
 // inbound-SMS hook. Same middleware position as Teams.
 app.use(notify.router);
 
+// Owner maintenance routes. Same middleware position as Teams and Notify.
+app.use(operator.router);
+
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '3.4-paywall-enforced',
+    version: '3.5-ops',
     paywall: 'enforced',
     auth: 'clerk website handoff + neon + stripe',
     googleSheets: false,
@@ -574,7 +583,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '3.4-paywall-enforced',
+    version: '3.5-ops',
     // 'enforced' = this build requires a real subscription before it will issue or
     // honor an extension token. If you ever see this missing or say something else,
     // the old give-it-away build is running.
