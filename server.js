@@ -142,6 +142,14 @@ function isAllowedStatus(status) {
   return s === 'active' || s === 'trialing';
 }
 
+// Owner-granted free access (MANUAL_ACTIVE_EMAILS in Railway). This is the ONLY
+// way to use the extension without a Stripe subscription, and it takes a
+// deliberate env-var edit — never a side effect of signing in.
+function isManualActiveEmail(email) {
+  const e = normalizeEmail(email);
+  return !!e && MANUAL_ACTIVE_EMAILS.indexOf(e) !== -1;
+}
+
 function planMeta(plan) {
   if (plan === 'team') return { plan: 'team', seatLimit: 3, priceId: STRIPE_PRICE_TEAM };
   return { plan: 'solo', seatLimit: 1, priceId: STRIPE_PRICE_SOLO };
@@ -153,13 +161,14 @@ function publicUser(user) {
   const s = (user && user.session) || {};
   const email = s.email || user.email || '';
   const clerkUserId = s.clerkUserId || user.clerk_user_id || '';
+  const subscriptionStatus = String(s.subscriptionStatus || user.subscription_status || 'inactive').toLowerCase();
   return {
     username: email,
     email: email,
     clerkUserId: clerkUserId,
-    active: true,
+    active: isAllowedStatus(subscriptionStatus) && user.extension_enabled !== false,
     plan: s.plan || user.plan || 'solo',
-    subscriptionStatus: s.subscriptionStatus || user.subscription_status || 'active',
+    subscriptionStatus: subscriptionStatus,
     deviceLimit: user.seat_limit || 1
   };
 }
@@ -331,6 +340,41 @@ async function requireActiveSession(req, res, next) {
     }
 
     req.user = verified;
+
+    // The token proves identity for 30 days. Billing state is checked LIVE on every
+    // call so a canceled, refunded, past-due or never-paid account loses the
+    // extension right away instead of riding an already-issued token.
+    if (pool && !isManualActiveEmail(verified.session && verified.session.email)) {
+      let account = null;
+      try {
+        account = await findAccessFromSession(verified.session);
+      } catch (dbErr) {
+        // Infrastructure fault, not an entitlement answer - do not lock out paying
+        // customers over a transient DB blip.
+        console.error('requireActiveSession: DB lookup failed, honoring token:', dbErr.message);
+        return next();
+      }
+
+      if (!account) {
+        return res.status(402).json({
+          success: false,
+          active: false,
+          error: 'No subscription found for this account. Subscribe at tryautopost.com to activate the extension.'
+        });
+      }
+
+      const liveStatus = String(account.subscription_status || 'inactive').toLowerCase();
+      if (!isAllowedStatus(liveStatus) || account.extension_enabled === false) {
+        return res.status(402).json({
+          success: false,
+          active: false,
+          error: 'Your AutoPost subscription is not active (' + liveStatus + '). Visit tryautopost.com to restore it.'
+        });
+      }
+
+      req.account = account;
+    }
+
     next();
   } catch (e) {
     return res.status(401).json({ success: false, active: false, error: 'Invalid session.' });
@@ -354,10 +398,10 @@ async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId
      ON CONFLICT (email)
      DO UPDATE SET
        clerk_user_id = COALESCE(EXCLUDED.clerk_user_id, autopost_users.clerk_user_id),
-       stripe_customer_id = EXCLUDED.stripe_customer_id,
-       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+       stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, autopost_users.stripe_customer_id),
+       stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, autopost_users.stripe_subscription_id),
        subscription_status = EXCLUDED.subscription_status,
-       current_period_end = EXCLUDED.current_period_end,
+       current_period_end = COALESCE(EXCLUDED.current_period_end, autopost_users.current_period_end),
        extension_enabled = CASE WHEN EXCLUDED.subscription_status IN ('active','trialing') THEN true ELSE false END,
        plan = EXCLUDED.plan,
        seat_limit = EXCLUDED.seat_limit,
@@ -377,8 +421,8 @@ async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId
        ON CONFLICT (owner_clerk_user_id)
        DO UPDATE SET
          owner_email = EXCLUDED.owner_email,
-         stripe_customer_id = EXCLUDED.stripe_customer_id,
-         stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+         stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, autopost_teams.stripe_customer_id),
+         stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, autopost_teams.stripe_subscription_id),
          plan = EXCLUDED.plan,
          seat_limit = EXCLUDED.seat_limit,
          subscription_status = EXCLUDED.subscription_status,
@@ -516,7 +560,8 @@ app.use(notify.router);
 app.get('/', (req, res) => {
   res.json({
     status: 'AutoPost server running',
-    version: '3.3-admin-activate',
+    version: '3.4-paywall-enforced',
+    paywall: 'enforced',
     auth: 'clerk website handoff + neon + stripe',
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
@@ -529,12 +574,20 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    version: '3.3-admin-activate',
+    version: '3.4-paywall-enforced',
+    // 'enforced' = this build requires a real subscription before it will issue or
+    // honor an extension token. If you ever see this missing or say something else,
+    // the old give-it-away build is running.
+    paywall: 'enforced',
     time: new Date().toISOString(),
     googleSheets: false,
     aiConfigured: !!ANTHROPIC_API_KEY,
     databaseLoaded: !!DATABASE_URL,
-    stripeLoaded: !!STRIPE_SECRET_KEY
+    stripeLoaded: !!STRIPE_SECRET_KEY,
+    // Must be true in production. If this is false, Stripe payments never reach the
+    // database, which now means PAYING customers get locked out.
+    stripeWebhookConfigured: !!STRIPE_WEBHOOK_SECRET,
+    manualComps: MANUAL_ACTIVE_EMAILS.length
   });
 });
 
@@ -651,19 +704,72 @@ app.post('/api/extension/create-token', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Account deactivated. Contact support@tryautopost.com' });
     }
 
-    // Sync to DB best-effort
-    try {
-      await upsertUserFromSubscription({ clerkUserId: auth.userId, email: verifiedEmail, status: 'active', plan: 'solo', seatLimit: 1, currentPeriodEnd: null });
-    } catch (_) {}
+    // PAYWALL. Signing in with Clerk proves WHO you are, not THAT you paid.
+    // The subscription row (written by the Stripe webhook or /api/admin/activate)
+    // is the only source of truth. This route must never create or activate one.
+    if (!pool) {
+      console.error('create-token: no DB configured - refusing to issue a token');
+      return res.status(503).json({ success: false, error: 'Billing system unavailable. Please try again in a minute.' });
+    }
 
-    const token = createSessionToken({ clerkUserId: auth.userId, email: verifiedEmail, plan: 'solo', subscriptionStatus: 'active' });
-    console.log('create-token: granted access to', verifiedEmail);
+    if (isManualActiveEmail(verifiedEmail)) {
+      console.log('create-token: manual allowlist grant for', verifiedEmail);
+      return res.json({
+        success: true,
+        token: createSessionToken({ clerkUserId: auth.userId, email: verifiedEmail, plan: 'solo', subscriptionStatus: 'active' }),
+        expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
+        user: { email: verifiedEmail, clerkUserId: auth.userId, plan: 'solo', subscriptionStatus: 'active', extensionEnabled: true }
+      });
+    }
+
+    let account = await findAccessByClerkUserId(auth.userId);
+    if (!account) account = await findAccessByEmail(verifiedEmail);
+
+    if (!account) {
+      console.log('create-token: DENIED (no subscription record) for', verifiedEmail);
+      return res.status(402).json({
+        success: false,
+        error: 'No subscription found for this account. Subscribe at tryautopost.com to activate the extension.'
+      });
+    }
+
+    const accountStatus = String(account.subscription_status || 'inactive').toLowerCase();
+    if (!isAllowedStatus(accountStatus) || account.extension_enabled === false) {
+      console.log('create-token: DENIED (status ' + accountStatus + ') for', verifiedEmail);
+      return res.status(402).json({
+        success: false,
+        error: 'Your AutoPost subscription is not active (' + accountStatus + '). Visit tryautopost.com to start or restore it.'
+      });
+    }
+
+    // First Clerk sign-in on a record created by the Stripe webhook: link the ids.
+    if (!account.clerk_user_id) {
+      try {
+        await pool.query(
+          `UPDATE autopost_users SET clerk_user_id = $1, updated_at = NOW()
+           WHERE LOWER(email) = $2 AND clerk_user_id IS NULL`,
+          [auth.userId, normalizeEmail(account.email || verifiedEmail)]
+        );
+      } catch (e) {
+        console.error('create-token: could not link clerk_user_id:', e.message);
+      }
+    }
+
+    const accountPlan = account.plan || 'solo';
+    const token = createSessionToken({ clerkUserId: auth.userId, email: verifiedEmail, plan: accountPlan, subscriptionStatus: accountStatus });
+    console.log('create-token: granted access to', verifiedEmail, '(status:', accountStatus + ')');
 
     return res.json({
       success: true,
       token,
-      expiresInSeconds: 30 * 24 * 60 * 60,
-      user: { email: verifiedEmail, clerkUserId: auth.userId, plan: 'solo', subscriptionStatus: 'active', extensionEnabled: true }
+      expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
+      user: {
+        email: verifiedEmail,
+        clerkUserId: auth.userId,
+        plan: accountPlan,
+        subscriptionStatus: accountStatus,
+        extensionEnabled: account.extension_enabled !== false
+      }
     });
   } catch (e) {
     console.error('create-token error:', e.message);
@@ -823,7 +929,7 @@ app.post('/login', async (req, res) => {
 });
 
 app.post('/verify-session', requireActiveSession, async (req, res) => {
-  return res.json({ success: true, active: true, user: publicUser(req.user) });
+  return res.json({ success: true, active: true, user: publicUser(req.account || req.user) });
 });
 
 app.post('/logout', (req, res) => {
