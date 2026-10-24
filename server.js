@@ -7,6 +7,7 @@ const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
 const createTeams = require('./teams');
 const createNotify = require('./notify');
 const createOperator = require('./operator');
+const createProspecting = require('./prospecting');
 
 const app = express();
 
@@ -201,6 +202,10 @@ const notify = createNotify({
 // Railway so production secrets never leave it. Operator-key protected.
 const operator = createOperator({ pool, stripe });
 
+// Outbound prospecting engine (px_* namespace). Boots paused with every agent
+// off; a failure inside it never affects sign-in, checkout or posting.
+const prospecting = createProspecting({ pool, getAuth, clerkClient, operator });
+
 async function initDb() {
   if (!pool) {
     console.log('Database not configured.');
@@ -276,6 +281,9 @@ async function initDb() {
   } catch (e) {
     console.error('Teams schema init failed (Solo unaffected):', e.message);
   }
+
+  // Prospecting migrations. Same rule: never blocks boot.
+  await prospecting.init();
 }
 
 async function findAccessByEmail(email) {
@@ -548,7 +556,7 @@ app.use(clerkMiddleware());
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Operator-Key');
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -565,6 +573,9 @@ app.use(notify.router);
 
 // Owner maintenance routes. Same middleware position as Teams and Notify.
 app.use(operator.router);
+
+// Manager dashboard API (/api/px/*). Clerk admin allowlist or operator key.
+app.use(prospecting.router);
 
 app.get('/', (req, res) => {
   res.json({
