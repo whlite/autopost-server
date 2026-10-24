@@ -19,8 +19,10 @@ function listMigrations() {
     .sort();
 }
 
+// Line endings are normalized so a Windows checkout (CRLF) and Railway's (LF)
+// agree on what "unchanged" means.
 function checksum(sql) {
-  return crypto.createHash('sha256').update(sql).digest('hex').slice(0, 16);
+  return crypto.createHash('sha256').update(sql.replace(/\r\n/g, '\n')).digest('hex').slice(0, 16);
 }
 
 async function migrate(pool, log) {
