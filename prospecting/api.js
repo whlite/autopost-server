@@ -538,22 +538,53 @@ module.exports = function createApi(deps) {
     } catch (e) { fail(res, e, 'supported dealers'); }
   });
 
-  // Grant dashboard access to an existing Clerk account, looked up by email.
-  router.post('/api/px/ops/admins', operatorOnly, async function (req, res) {
+  // The dashboard is single-owner. Exactly one Clerk account may hold access, it
+  // must own a VERIFIED copy of the email, and only the operator key (never the
+  // dashboard itself) can set or replace it.
+  router.get('/api/px/ops/admins', operatorOnly, async function (req, res) {
     try {
-      const email = String((req.body && req.body.email) || '').trim().toLowerCase();
-      if (!email || !clerkClient) return res.status(400).json({ success: false, error: 'email required' });
+      res.json({ success: true, admins: (await pool.query(`SELECT clerk_user_id, email, added_at FROM px_admins`)).rows });
+    } catch (e) { fail(res, e, 'list admins'); }
+  });
+
+  router.post('/api/px/ops/admins', operatorOnly, async function (req, res) {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || !clerkClient) return res.status(400).json({ success: false, error: 'email required' });
+    const client = await pool.connect();
+    try {
       const list = await clerkClient.users.getUserList({ emailAddress: [email] });
       const users = Array.isArray(list) ? list : (list && list.data) || [];
-      if (!users.length) return res.status(404).json({ success: false, error: 'No Clerk account with that email.' });
-      const u = users[0];
-      await pool.query(
+      const matches = users.filter(function (u) {
+        return (u.emailAddresses || []).some(function (a) {
+          return String(a.emailAddress || '').toLowerCase() === email && a.verification && a.verification.status === 'verified';
+        });
+      });
+      if (matches.length !== 1) {
+        return res.status(404).json({ success: false, error: matches.length ? 'More than one account claims that email.' : 'No Clerk account with that VERIFIED email.' });
+      }
+      const u = matches[0];
+
+      await client.query('BEGIN');
+      await client.query('LOCK TABLE px_admins IN EXCLUSIVE MODE');
+      const others = (await client.query(`SELECT clerk_user_id, email FROM px_admins WHERE clerk_user_id <> $1`, [u.id])).rows;
+      if (others.length && req.body.replace !== true) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, error: 'The dashboard already has an owner. Pass replace:true to swap it.', current: others });
+      }
+      await client.query(`DELETE FROM px_admins WHERE clerk_user_id <> $1`, [u.id]);
+      await client.query(
         `INSERT INTO px_admins (clerk_user_id, email, added_by) VALUES ($1,$2,'operator') ON CONFLICT (clerk_user_id) DO NOTHING`,
         [u.id, email]);
-      adminCache.delete(u.id);
-      await audit('operator', 'admin_added', 'admin', u.id, { email });
-      res.json({ success: true, clerkUserId: u.id });
-    } catch (e) { fail(res, e, 'add admin'); }
+      await client.query(
+        `INSERT INTO px_audit (actor, action, target_type, target_id, detail) VALUES ('operator','owner_set','admin',$1,$2)`,
+        [u.id, JSON.stringify({ email, replaced: others.map(function (o) { return o.email; }) })]);
+      await client.query('COMMIT');
+      adminCache.clear();
+      res.json({ success: true, clerkUserId: u.id, email });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(function () {});
+      fail(res, e, 'set owner');
+    } finally { client.release(); }
   });
 
   return { router };
