@@ -1,5 +1,6 @@
 // photoscene.js — AutoPost Photo Scenes: stage a car's cover photo like a
-// private seller took it at the park, with Photoroom's Image Editing API.
+// private seller took it at the park (or at night), with Photoroom's Image
+// Editing API.
 //
 // WHY IT RUNS HERE
 //   The Photoroom key is a paid credential. Anything shipped inside the Chrome
@@ -20,6 +21,7 @@
 //     the photo back.
 //
 // POST /api/photo/scene  { image: "data:image/jpeg;base64,...", seed }
+//   { ..., scene: 'park' | 'night' }  (anything else, incl. old names, = park)
 //   -> 200 { success, dataURL, uncertainty, remainingToday }
 //   -> 429 { success:false, error, limit: 'daily' | 'monthly', remainingToday }
 // GET  /api/photo/scene/quota   -> { used, limit, remaining }  (signed-in user, for the popup bar)
@@ -35,11 +37,24 @@ const MONTHLY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_MONTHLY_LIMIT) 
 const TIMEOUT_MS = 70000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
-// The car "taken to the park" by a private seller: Photoroom generates the
-// scene and relights / shadows the car to match.
-const PARK_PROMPT = 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
-  'mature shade trees, a grassy lawn and a walking path behind it, clean asphalt, soft natural daylight, ' +
-  'realistic candid photo taken on a phone by a private seller';
+// Two looks, both "a private seller took the car somewhere and shot it on a
+// phone": Photoroom generates the scene and shadows the car to match.
+//   park  - daytime at the edge of a park; the car's own colours are kept.
+//   night - a lit parking lot at night; the car is relit to match the lamps.
+const SCENES = {
+  park: {
+    prompt: 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
+      'mature shade trees, a grassy lawn and a walking path behind it, clean asphalt, soft natural daylight, ' +
+      'realistic candid photo taken on a phone by a private seller',
+    lighting: 'ai.preserve-hue-and-saturation'
+  },
+  night: {
+    prompt: 'A car parked in a quiet, well-lit parking lot at night, warm streetlights overhead casting soft pools ' +
+      'of light on the asphalt, softly blurred city lights and trees in the background, ' +
+      'realistic night photo taken on a phone by a private seller',
+    lighting: 'ai.auto'
+  }
+};
 
 module.exports = function createPhotoScene(deps) {
   const requireActiveSession = deps.requireActiveSession;
@@ -135,7 +150,7 @@ module.exports = function createPhotoScene(deps) {
   });
 
   router.get('/api/photo/scene/health', (req, res) => {
-    res.json({ configured: !!process.env.PHOTOROOM_API_KEY, scenes: ['park'], dailyLimit: DAILY_LIMIT });
+    res.json({ configured: !!process.env.PHOTOROOM_API_KEY, scenes: Object.keys(SCENES), dailyLimit: DAILY_LIMIT });
   });
 
   router.post('/api/photo/scene', requireActiveSession, async (req, res) => {
@@ -149,6 +164,7 @@ module.exports = function createPhotoScene(deps) {
     if (bytes.length < 2000 || bytes.length > MAX_IMAGE_BYTES) {
       return res.status(400).json({ success: false, error: 'Image size out of range' });
     }
+    const scene = body.scene === 'night' ? 'night' : 'park';
     const who = userKey(req);
     const quota = await reserve(who);
     if (!quota.ok) {
@@ -164,11 +180,11 @@ module.exports = function createPhotoScene(deps) {
 
     const form = new FormData();
     form.append('imageFile', new Blob([bytes], { type: 'image/' + (m[1].toLowerCase() === 'jpg' ? 'jpeg' : m[1].toLowerCase()) }), 'car.jpg');
-    form.append('background.prompt', PARK_PROMPT);
+    form.append('background.prompt', SCENES[scene].prompt);
     const seed = Math.abs(parseInt(body.seed, 10)) % 2147483647;
     if (seed) form.append('background.seed', String(seed));
     form.append('shadow.mode', 'ai.auto-with-overrides');
-    form.append('lighting.mode', 'ai.preserve-hue-and-saturation');
+    form.append('lighting.mode', SCENES[scene].lighting);
     form.append('outputSize', 'originalImage');
     form.append('padding', '0.08');
     form.append('export.format', 'jpeg');
@@ -198,7 +214,7 @@ module.exports = function createPhotoScene(deps) {
       }
       const out = Buffer.from(await r.arrayBuffer());
       const uncertainty = parseFloat(r.headers.get('x-uncertainty-score'));
-      console.log('photoscene: park |', out.length, 'bytes |', Date.now() - started, 'ms | uncertainty', uncertainty, '| user', who, '| left today', quota.remaining);
+      console.log('photoscene:', scene, '|', out.length, 'bytes |', Date.now() - started, 'ms | uncertainty', uncertainty, '| user', who, '| left today', quota.remaining);
       res.json({
         success: true,
         dataURL: 'data:image/jpeg;base64,' + out.toString('base64'),
