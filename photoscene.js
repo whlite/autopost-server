@@ -11,7 +11,8 @@
 //   - Only signed-in, paying (or comped) users: requireActiveSession.
 //   - The extension sends ONE photo per car (the cover) and caches the result,
 //     so retries and reposts of the same car don't pay again.
-//   - Per user: PHOTO_SCENE_DAILY_LIMIT (default 5 per day).
+//   - Per user: PHOTO_SCENE_DAILY_LIMIT (default 10 cars per day), rolling over
+//     at midnight PHOTO_SCENE_TZ (default America/Denver).
 //   - Whole account: PHOTO_SCENE_MONTHLY_LIMIT (default 950 per month) so we
 //     stop before Photoroom does.
 //   - Counts live in Postgres (ap_photo_scene_usage) so a redeploy doesn't
@@ -21,12 +22,15 @@
 // POST /api/photo/scene  { image: "data:image/jpeg;base64,...", seed }
 //   -> 200 { success, dataURL, uncertainty, remainingToday }
 //   -> 429 { success:false, error, limit: 'daily' | 'monthly', remainingToday }
+// GET  /api/photo/scene/quota   -> { used, limit, remaining }  (signed-in user, for the popup bar)
 // GET  /api/photo/scene/health  -> { configured, dailyLimit }  (no secrets)
 
 const express = require('express');
 
 const PHOTOROOM_URL = 'https://image-api.photoroom.com/v2/edit';
-const DAILY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_DAILY_LIMIT) || 5);
+const DAILY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_DAILY_LIMIT) || 10);
+// Days roll over at local midnight for the dealers (Mountain time by default).
+const DAY_TZ = process.env.PHOTO_SCENE_TZ || 'America/Denver';
 const MONTHLY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_MONTHLY_LIMIT) || 950);
 const TIMEOUT_MS = 70000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -49,7 +53,10 @@ module.exports = function createPhotoScene(deps) {
     return String(s.email || s.clerkUserId || 'unknown').toLowerCase();
   }
 
-  function today() { return new Date().toISOString().slice(0, 10); }
+  function today() {
+    try { return new Intl.DateTimeFormat('en-CA', { timeZone: DAY_TZ }).format(new Date()); } // YYYY-MM-DD
+    catch (e) { return new Date().toISOString().slice(0, 10); }
+  }
 
   function ensureTable() {
     if (!pool) return Promise.reject(new Error('no db'));
@@ -71,7 +78,8 @@ module.exports = function createPhotoScene(deps) {
     try {
       await ensureTable();
       const month = await pool.query(
-        "SELECT COALESCE(SUM(count), 0)::int AS n FROM ap_photo_scene_usage WHERE day >= date_trunc('month', CURRENT_DATE)"
+        'SELECT COALESCE(SUM(count), 0)::int AS n FROM ap_photo_scene_usage WHERE day >= $1',
+        [day.slice(0, 7) + '-01']
       );
       if (month.rows[0].n >= MONTHLY_LIMIT) return { ok: false, limit: 'monthly', remaining: 0 };
       const r = await pool.query(
@@ -110,6 +118,22 @@ module.exports = function createPhotoScene(deps) {
     }
   }
 
+  async function usedToday(who) {
+    const day = today();
+    try {
+      await ensureTable();
+      const r = await pool.query('SELECT count FROM ap_photo_scene_usage WHERE user_key = $1 AND day = $2', [who, day]);
+      return r.rows.length ? r.rows[0].count : 0;
+    } catch (e) {
+      return memory.get(who + '|' + day) || 0;
+    }
+  }
+
+  router.get('/api/photo/scene/quota', requireActiveSession, async (req, res) => {
+    const used = Math.min(DAILY_LIMIT, await usedToday(userKey(req)));
+    res.json({ success: true, used, limit: DAILY_LIMIT, remaining: Math.max(0, DAILY_LIMIT - used) });
+  });
+
   router.get('/api/photo/scene/health', (req, res) => {
     res.json({ configured: !!process.env.PHOTOROOM_API_KEY, scenes: ['park'], dailyLimit: DAILY_LIMIT });
   });
@@ -133,6 +157,7 @@ module.exports = function createPhotoScene(deps) {
         success: false,
         limit: quota.limit,
         remainingToday: 0,
+        dailyLimit: DAILY_LIMIT,
         error: quota.limit === 'daily' ? 'Daily limit reached (' + DAILY_LIMIT + ' cars per day)' : 'Photo scenes are paused for this month'
       });
     }
@@ -178,7 +203,8 @@ module.exports = function createPhotoScene(deps) {
         success: true,
         dataURL: 'data:image/jpeg;base64,' + out.toString('base64'),
         uncertainty: isFinite(uncertainty) ? uncertainty : null,
-        remainingToday: quota.remaining
+        remainingToday: quota.remaining,
+        dailyLimit: DAILY_LIMIT
       });
     } catch (e) {
       console.error('photoscene: request failed:', e.name === 'AbortError' ? 'timeout' : e.message, '| user', who);
