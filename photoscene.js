@@ -1,6 +1,5 @@
-// photoscene.js — AutoPost Photo Scenes: put a car's exterior photos into a
-// realistic "private seller" park scene, or onto clean black / white, with
-// Photoroom's Image Editing API.
+// photoscene.js — AutoPost Photo Scenes: stage a car's cover photo like a
+// private seller took it at the park, with Photoroom's Image Editing API.
 //
 // WHY IT RUNS HERE
 //   The Photoroom key is a paid credential. Anything shipped inside the Chrome
@@ -8,64 +7,111 @@
 //   photo here (with its AutoPost session token) and this server talks to
 //   Photoroom. The key lives only in Railway: PHOTOROOM_API_KEY.
 //
-// COST CONTROL
+// COST CONTROL (Photoroom Plus: 1,000 images/month)
 //   - Only signed-in, paying (or comped) users: requireActiveSession.
-//   - The extension already filters to exterior shots on-device before calling.
-//   - Per-user daily cap: PHOTO_SCENE_DAILY_LIMIT (default 150 images/day).
+//   - The extension sends ONE photo per car (the cover) and caches the result,
+//     so retries and reposts of the same car don't pay again.
+//   - Per user: PHOTO_SCENE_DAILY_LIMIT (default 5 per day).
+//   - Whole account: PHOTO_SCENE_MONTHLY_LIMIT (default 950 per month) so we
+//     stop before Photoroom does.
+//   - Counts live in Postgres (ap_photo_scene_usage) so a redeploy doesn't
+//     reset them; in memory if the DB is unavailable. A failed staging gives
+//     the photo back.
 //
-// POST /api/photo/scene  { image: "data:image/jpeg;base64,...", scene, seed }
-//   -> 200 { success, dataURL, uncertainty }   (uncertainty: Photoroom's cut-out
-//      confidence, 0 = sure, 1 = unsure; the extension keeps the original above
-//      a threshold)
-// GET  /api/photo/scene/health  -> { configured }  (no secrets, no credits used)
+// POST /api/photo/scene  { image: "data:image/jpeg;base64,...", seed }
+//   -> 200 { success, dataURL, uncertainty, remainingToday }
+//   -> 429 { success:false, error, limit: 'daily' | 'monthly', remainingToday }
+// GET  /api/photo/scene/health  -> { configured, dailyLimit }  (no secrets)
 
 const express = require('express');
 
 const PHOTOROOM_URL = 'https://image-api.photoroom.com/v2/edit';
-const DAILY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_DAILY_LIMIT) || 150);
+const DAILY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_DAILY_LIMIT) || 5);
+const MONTHLY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_MONTHLY_LIMIT) || 950);
 const TIMEOUT_MS = 70000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
-// Three looks, chosen to be dependable:
-//   outdoor - the car "taken to the park" by a private seller: Photoroom
-//             generates the scene and relights/shadows the car to match.
-//   black / white - clean solid backdrops with a real contact shadow; no
-//             generation, so nothing can come out strange.
-const OUTDOOR_PROMPT = 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
+// The car "taken to the park" by a private seller: Photoroom generates the
+// scene and relights / shadows the car to match.
+const PARK_PROMPT = 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
   'mature shade trees, a grassy lawn and a walking path behind it, clean asphalt, soft natural daylight, ' +
   'realistic candid photo taken on a phone by a private seller';
-const SCENES = {
-  outdoor: { prompt: OUTDOOR_PROMPT },
-  black: { color: '0B0B0C' },
-  white: { color: 'FFFFFF' }
-};
-// Scene names from earlier extension builds.
-const LEGACY = { driveway: 'outdoor', street: 'outdoor', lot: 'outdoor', scenic: 'outdoor' };
 
 module.exports = function createPhotoScene(deps) {
   const requireActiveSession = deps.requireActiveSession;
+  const pool = deps.pool || null;
   const router = express.Router();
-  const usage = new Map(); // email|day -> count
+  const memory = new Map(); // fallback: "user|day" -> count, "*|month" -> count
+  let tableReady = null;
 
   function userKey(req) {
     const s = (req.user && req.user.session) || {};
-    return String(s.email || s.userId || s.username || 'unknown').toLowerCase();
+    return String(s.email || s.clerkUserId || 'unknown').toLowerCase();
   }
 
-  function takeQuota(who) {
-    const day = new Date().toISOString().slice(0, 10);
-    const k = who + '|' + day;
-    const n = usage.get(k) || 0;
-    if (n >= DAILY_LIMIT) return false;
-    usage.set(k, n + 1);
-    if (usage.size > 5000) {
-      for (const key of usage.keys()) if (!key.endsWith('|' + day)) usage.delete(key);
+  function today() { return new Date().toISOString().slice(0, 10); }
+
+  function ensureTable() {
+    if (!pool) return Promise.reject(new Error('no db'));
+    if (!tableReady) {
+      tableReady = pool.query(
+        'CREATE TABLE IF NOT EXISTS ap_photo_scene_usage (' +
+        '  user_key TEXT NOT NULL,' +
+        '  day DATE NOT NULL,' +
+        '  count INTEGER NOT NULL DEFAULT 0,' +
+        '  PRIMARY KEY (user_key, day))'
+      ).catch((e) => { tableReady = null; throw e; });
     }
-    return true;
+    return tableReady;
+  }
+
+  // Reserve one photo for this user today. Returns { ok, remaining, limit }.
+  async function reserve(who) {
+    const day = today();
+    try {
+      await ensureTable();
+      const month = await pool.query(
+        "SELECT COALESCE(SUM(count), 0)::int AS n FROM ap_photo_scene_usage WHERE day >= date_trunc('month', CURRENT_DATE)"
+      );
+      if (month.rows[0].n >= MONTHLY_LIMIT) return { ok: false, limit: 'monthly', remaining: 0 };
+      const r = await pool.query(
+        'INSERT INTO ap_photo_scene_usage (user_key, day, count) VALUES ($1, $2, 1) ' +
+        'ON CONFLICT (user_key, day) DO UPDATE SET count = ap_photo_scene_usage.count + 1 ' +
+        'WHERE ap_photo_scene_usage.count < $3 RETURNING count',
+        [who, day, DAILY_LIMIT]
+      );
+      if (!r.rows.length) return { ok: false, limit: 'daily', remaining: 0 };
+      return { ok: true, remaining: Math.max(0, DAILY_LIMIT - r.rows[0].count) };
+    } catch (e) {
+      if (pool) console.error('photoscene: usage DB unavailable, counting in memory:', e.message);
+      const k = who + '|' + day, mk = '*|' + day.slice(0, 7);
+      if ((memory.get(mk) || 0) >= MONTHLY_LIMIT) return { ok: false, limit: 'monthly', remaining: 0 };
+      const n = memory.get(k) || 0;
+      if (n >= DAILY_LIMIT) return { ok: false, limit: 'daily', remaining: 0 };
+      memory.set(k, n + 1);
+      memory.set(mk, (memory.get(mk) || 0) + 1);
+      return { ok: true, remaining: Math.max(0, DAILY_LIMIT - n - 1) };
+    }
+  }
+
+  // Staging failed: give the photo back.
+  async function release(who) {
+    const day = today();
+    try {
+      await ensureTable();
+      await pool.query(
+        'UPDATE ap_photo_scene_usage SET count = GREATEST(count - 1, 0) WHERE user_key = $1 AND day = $2',
+        [who, day]
+      );
+    } catch (e) {
+      const k = who + '|' + day, mk = '*|' + day.slice(0, 7);
+      if (memory.get(k)) memory.set(k, memory.get(k) - 1);
+      if (memory.get(mk)) memory.set(mk, memory.get(mk) - 1);
+    }
   }
 
   router.get('/api/photo/scene/health', (req, res) => {
-    res.json({ configured: !!process.env.PHOTOROOM_API_KEY, scenes: Object.keys(SCENES), dailyLimit: DAILY_LIMIT });
+    res.json({ configured: !!process.env.PHOTOROOM_API_KEY, scenes: ['park'], dailyLimit: DAILY_LIMIT });
   });
 
   router.post('/api/photo/scene', requireActiveSession, async (req, res) => {
@@ -73,8 +119,6 @@ module.exports = function createPhotoScene(deps) {
     if (!apiKey) return res.status(503).json({ success: false, error: 'Photo scenes are not configured' });
 
     const body = req.body || {};
-    const asked = LEGACY[body.scene] || body.scene;
-    const scene = Object.prototype.hasOwnProperty.call(SCENES, asked) ? asked : 'outdoor';
     const m = /^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i.exec(String(body.image || ''));
     if (!m) return res.status(400).json({ success: false, error: 'Expected a base64 image data URL' });
     const bytes = Buffer.from(m[2], 'base64');
@@ -82,20 +126,22 @@ module.exports = function createPhotoScene(deps) {
       return res.status(400).json({ success: false, error: 'Image size out of range' });
     }
     const who = userKey(req);
-    if (!takeQuota(who)) {
-      return res.status(429).json({ success: false, error: 'Daily photo scene limit reached' });
+    const quota = await reserve(who);
+    if (!quota.ok) {
+      console.log('photoscene:', quota.limit, 'limit reached | user', who);
+      return res.status(429).json({
+        success: false,
+        limit: quota.limit,
+        remainingToday: 0,
+        error: quota.limit === 'daily' ? 'Daily limit reached (' + DAILY_LIMIT + ' cars per day)' : 'Photo scenes are paused for this month'
+      });
     }
 
     const form = new FormData();
     form.append('imageFile', new Blob([bytes], { type: 'image/' + (m[1].toLowerCase() === 'jpg' ? 'jpeg' : m[1].toLowerCase()) }), 'car.jpg');
-    if (SCENES[scene].prompt) {
-      form.append('background.prompt', SCENES[scene].prompt);
-      // Same seed for every photo of one car keeps them in the same "place".
-      const seed = Math.abs(parseInt(body.seed, 10)) % 2147483647;
-      if (seed) form.append('background.seed', String(seed));
-    } else {
-      form.append('background.color', SCENES[scene].color);
-    }
+    form.append('background.prompt', PARK_PROMPT);
+    const seed = Math.abs(parseInt(body.seed, 10)) % 2147483647;
+    if (seed) form.append('background.seed', String(seed));
     form.append('shadow.mode', 'ai.auto-with-overrides');
     form.append('lighting.mode', 'ai.preserve-hue-and-saturation');
     form.append('outputSize', 'originalImage');
@@ -120,20 +166,23 @@ module.exports = function createPhotoScene(deps) {
         let msg = '';
         try { const j = await r.json(); msg = (j && j.error && j.error.message) || j.detail || ''; } catch (e) {}
         console.error('photoscene: Photoroom', r.status, msg, '| user', who);
+        await release(who);
         // Out of credits / bad key is our problem, not the user's request.
-        const status = (r.status === 401 || r.status === 402 || r.status === 403) ? 503 : (r.status === 429 ? 429 : 502);
+        const status = (r.status === 401 || r.status === 402 || r.status === 403) ? 503 : (r.status === 429 ? 503 : 502);
         return res.status(status).json({ success: false, error: 'Photo scene service unavailable (' + r.status + ')' });
       }
       const out = Buffer.from(await r.arrayBuffer());
       const uncertainty = parseFloat(r.headers.get('x-uncertainty-score'));
-      console.log('photoscene:', scene, '|', out.length, 'bytes |', Date.now() - started, 'ms | uncertainty', uncertainty, '| user', who);
+      console.log('photoscene: park |', out.length, 'bytes |', Date.now() - started, 'ms | uncertainty', uncertainty, '| user', who, '| left today', quota.remaining);
       res.json({
         success: true,
         dataURL: 'data:image/jpeg;base64,' + out.toString('base64'),
-        uncertainty: isFinite(uncertainty) ? uncertainty : null
+        uncertainty: isFinite(uncertainty) ? uncertainty : null,
+        remainingToday: quota.remaining
       });
     } catch (e) {
       console.error('photoscene: request failed:', e.name === 'AbortError' ? 'timeout' : e.message, '| user', who);
+      await release(who);
       res.status(504).json({ success: false, error: 'Photo scene timed out' });
     } finally {
       clearTimeout(timer);

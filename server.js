@@ -202,7 +202,7 @@ const notify = createNotify({
 // Owner maintenance routes (billing reconcile, schema view). They run inside
 // Railway so production secrets never leave it. Operator-key protected.
 const operator = createOperator({ pool, stripe });
-const photoScene = createPhotoScene({ requireActiveSession });
+const photoScene = createPhotoScene({ requireActiveSession, pool });
 
 // Outbound prospecting engine (px_* namespace). Boots paused with every agent
 // off; a failure inside it never affects sign-in, checkout or posting.
