@@ -1,5 +1,5 @@
 // photoscene.js — AutoPost Photo Scenes: put a car's exterior photos into a
-// realistic "private seller" scene (driveway, street, parking lot...) with
+// realistic "private seller" park scene, or onto clean black / white, with
 // Photoroom's Image Editing API.
 //
 // WHY IT RUNS HERE
@@ -26,16 +26,21 @@ const DAILY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_DAILY_LIMIT) || 1
 const TIMEOUT_MS = 70000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
-// The tail every prompt shares is what makes it read as a private sale rather
-// than a dealer lot or an ad.
-const SELLER_LOOK = 'natural daylight, realistic photo taken on a phone by a private seller';
+// Three looks, chosen to be dependable:
+//   outdoor - the car "taken to the park" by a private seller: Photoroom
+//             generates the scene and relights/shadows the car to match.
+//   black / white - clean solid backdrops with a real contact shadow; no
+//             generation, so nothing can come out strange.
+const OUTDOOR_PROMPT = 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
+  'mature shade trees, a grassy lawn and a walking path behind it, clean asphalt, soft natural daylight, ' +
+  'realistic candid photo taken on a phone by a private seller';
 const SCENES = {
-  driveway: 'A car parked in the concrete driveway of a well-kept suburban family home on a sunny afternoon, green lawn and trimmed hedges, ' + SELLER_LOOK,
-  street: 'A car parked along the curb of a quiet tree-lined residential street on a sunny day, houses and sidewalks in the background, ' + SELLER_LOOK,
-  lot: 'A car parked by itself in a clean, nearly empty shopping center parking lot at golden hour, fresh painted lines, soft warm sunlight, ' + SELLER_LOOK,
-  scenic: 'A car parked on a gravel pull-off beside a quiet two-lane road with open desert hills and mountains in the distance under a clear blue sky, ' + SELLER_LOOK,
-  white: null // clean white background with a real contact shadow
+  outdoor: { prompt: OUTDOOR_PROMPT },
+  black: { color: '0B0B0C' },
+  white: { color: 'FFFFFF' }
 };
+// Scene names from earlier extension builds.
+const LEGACY = { driveway: 'outdoor', street: 'outdoor', lot: 'outdoor', scenic: 'outdoor' };
 
 module.exports = function createPhotoScene(deps) {
   const requireActiveSession = deps.requireActiveSession;
@@ -68,7 +73,8 @@ module.exports = function createPhotoScene(deps) {
     if (!apiKey) return res.status(503).json({ success: false, error: 'Photo scenes are not configured' });
 
     const body = req.body || {};
-    const scene = Object.prototype.hasOwnProperty.call(SCENES, body.scene) ? body.scene : 'driveway';
+    const asked = LEGACY[body.scene] || body.scene;
+    const scene = Object.prototype.hasOwnProperty.call(SCENES, asked) ? asked : 'outdoor';
     const m = /^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i.exec(String(body.image || ''));
     if (!m) return res.status(400).json({ success: false, error: 'Expected a base64 image data URL' });
     const bytes = Buffer.from(m[2], 'base64');
@@ -82,13 +88,13 @@ module.exports = function createPhotoScene(deps) {
 
     const form = new FormData();
     form.append('imageFile', new Blob([bytes], { type: 'image/' + (m[1].toLowerCase() === 'jpg' ? 'jpeg' : m[1].toLowerCase()) }), 'car.jpg');
-    if (SCENES[scene]) {
-      form.append('background.prompt', SCENES[scene]);
+    if (SCENES[scene].prompt) {
+      form.append('background.prompt', SCENES[scene].prompt);
       // Same seed for every photo of one car keeps them in the same "place".
       const seed = Math.abs(parseInt(body.seed, 10)) % 2147483647;
       if (seed) form.append('background.seed', String(seed));
     } else {
-      form.append('background.color', 'FFFFFF');
+      form.append('background.color', SCENES[scene].color);
     }
     form.append('shadow.mode', 'ai.auto-with-overrides');
     form.append('lighting.mode', 'ai.preserve-hue-and-saturation');
