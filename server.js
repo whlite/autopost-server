@@ -7,6 +7,7 @@ const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
 const createTeams = require('./teams');
 const createNotify = require('./notify');
 const createOperator = require('./operator');
+const createPhotoScene = require('./photoscene');
 const createProspecting = require('./prospecting');
 
 const app = express();
@@ -201,6 +202,7 @@ const notify = createNotify({
 // Owner maintenance routes (billing reconcile, schema view). They run inside
 // Railway so production secrets never leave it. Operator-key protected.
 const operator = createOperator({ pool, stripe });
+const photoScene = createPhotoScene({ requireActiveSession });
 
 // Outbound prospecting engine (px_* namespace). Boots paused with every agent
 // off; a failure inside it never affects sign-in, checkout or posting.
@@ -576,6 +578,9 @@ app.use(operator.router);
 
 // Manager dashboard API (/api/px/*). Clerk admin allowlist or operator key.
 app.use(prospecting.router);
+
+// Photo Scenes: exterior car photos -> Photoroom AI backgrounds (PHOTOROOM_API_KEY).
+app.use(photoScene.router);
 
 app.get('/', (req, res) => {
   res.json({
