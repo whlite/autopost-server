@@ -45,11 +45,15 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 // camera framed it, so the ground and horizon follow the real camera height.
 const SCENES = {
   driveway: {
-    prompt: 'A car parked on the clean concrete driveway of a nice suburban home on a sunny afternoon, ' +
-      'an attached garage and a tidy front lawn with trimmed hedges behind it, the driveway continuing ' +
-      'under and around the car at the same camera angle, height and perspective as the car, ' +
-      'wheels resting naturally on the concrete, soft natural daylight, ' +
-      'realistic candid photo taken on a phone by the owner selling their car',
+    // v2 (after the first live result came back looking like a park): the HOUSE
+    // must fill the frame behind the car. No lawns, trees or paths in the prompt -
+    // those words are what pulled the model back to a park.
+    prompt: 'Photo of a car parked in the concrete driveway of a modern two-story suburban house, ' +
+      'directly in front of a closed dark garage door, the house front with brick and stone walls, ' +
+      'windows and the garage fills the entire background right behind the car, ' +
+      'light gray concrete driveway under the car, seen from the same camera angle, height and ' +
+      'perspective as the car, bright daytime, realistic photo taken on a phone by the homeowner ' +
+      'selling their car, in the driveway at home',
     lighting: 'ai.preserve-hue-and-saturation'
   }
 };
