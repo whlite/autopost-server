@@ -1,5 +1,5 @@
 // photoscene.js — AutoPost Photo Scenes: stage a car's cover photo like a
-// private seller took it at the park (or at night), with Photoroom's Image
+// private seller took it on their driveway, with Photoroom's Image
 // Editing API.
 //
 // WHY IT RUNS HERE
@@ -21,7 +21,7 @@
 //     the photo back.
 //
 // POST /api/photo/scene  { image: "data:image/jpeg;base64,...", seed }
-//   { ..., scene: 'park' | 'night' }  (anything else, incl. old names, = park)
+//   { ..., scene }  (ignored: every scene is the driveway now)
 //   -> 200 { success, dataURL, uncertainty, remainingToday }
 //   -> 429 { success:false, error, limit: 'daily' | 'monthly', remainingToday }
 // GET  /api/photo/scene/quota   -> { used, limit, remaining }  (signed-in user, for the popup bar)
@@ -37,22 +37,20 @@ const MONTHLY_LIMIT = Math.max(1, Number(process.env.PHOTO_SCENE_MONTHLY_LIMIT) 
 const TIMEOUT_MS = 70000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
-// Two looks, both "a private seller took the car somewhere and shot it on a
-// phone": Photoroom generates the scene and shadows the car to match.
-//   park  - daytime at the edge of a park; the car's own colours are kept.
-//   night - a lit parking lot at night; the car is relit to match the lamps.
+// One look: the owner pulled the car onto their driveway and shot it on a phone.
+// Photoroom generates the scene and shadows the car to match. The prompt never
+// fixes a viewpoint - dealer photos are 3/4 front, profile, rear 3/4, tight crops
+// - it tells the model to build the driveway around the car's OWN angle, and
+// referenceBox=originalImage (below) keeps the car exactly where the dealer's
+// camera framed it, so the ground and horizon follow the real camera height.
 const SCENES = {
-  park: {
-    prompt: 'A car parked in a quiet parking spot at the edge of a green city park on a sunny afternoon, ' +
-      'mature shade trees, a grassy lawn and a walking path behind it, clean asphalt, soft natural daylight, ' +
-      'realistic candid photo taken on a phone by a private seller',
+  driveway: {
+    prompt: 'A car parked on the clean concrete driveway of a nice suburban home on a sunny afternoon, ' +
+      'an attached garage and a tidy front lawn with trimmed hedges behind it, the driveway continuing ' +
+      'under and around the car at the same camera angle, height and perspective as the car, ' +
+      'wheels resting naturally on the concrete, soft natural daylight, ' +
+      'realistic candid photo taken on a phone by the owner selling their car',
     lighting: 'ai.preserve-hue-and-saturation'
-  },
-  night: {
-    prompt: 'A car parked in a quiet, well-lit parking lot at night, warm streetlights overhead casting soft pools ' +
-      'of light on the asphalt, softly blurred city lights and trees in the background, ' +
-      'realistic night photo taken on a phone by a private seller',
-    lighting: 'ai.auto'
   }
 };
 
@@ -164,7 +162,7 @@ module.exports = function createPhotoScene(deps) {
     if (bytes.length < 2000 || bytes.length > MAX_IMAGE_BYTES) {
       return res.status(400).json({ success: false, error: 'Image size out of range' });
     }
-    const scene = body.scene === 'night' ? 'night' : 'park';
+    const scene = 'driveway'; // park / night / older names all map here now
     const who = userKey(req);
     const quota = await reserve(who);
     if (!quota.ok) {
@@ -186,7 +184,9 @@ module.exports = function createPhotoScene(deps) {
     form.append('shadow.mode', 'ai.auto-with-overrides');
     form.append('lighting.mode', SCENES[scene].lighting);
     form.append('outputSize', 'originalImage');
-    form.append('padding', '0.08');
+    // Keep the car where the dealer framed it (no re-centering / padding), so the
+    // generated driveway matches that photo's angle and camera height.
+    form.append('referenceBox', 'originalImage');
     form.append('export.format', 'jpeg');
 
     const ctrl = new AbortController();
