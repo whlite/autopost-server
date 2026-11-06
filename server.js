@@ -9,6 +9,7 @@ const createNotify = require('./notify');
 const createOperator = require('./operator');
 const createPhotoScene = require('./photoscene');
 const createProspecting = require('./prospecting');
+const createTasksAi = require('./tasksai');
 
 const app = express();
 
@@ -552,6 +553,10 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     return res.status(400).send(`Webhook Error: ${e.message}`);
   }
 });
+
+// AutoTasks AI relay: mounted before the global JSON/CORS middleware because the
+// Anthropic SDK sends its own headers (x-api-key, anthropic-*, x-stainless-*).
+app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(clerkMiddleware());
