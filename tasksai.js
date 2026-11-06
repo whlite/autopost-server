@@ -13,7 +13,8 @@
 //   used to count and cap usage per install. The real key never leaves here.
 //
 // COST CONTROL (every number is a Railway env var, in US dollars)
-//   - Only the models AutoTasks uses (Haiku / Sonnet / Opus 5.5).
+//   - Haiku 5.5 ONLY (about $0.0005 a customer). TASKS_AI_MODELS can widen it, comma-separated, but never do that
+//     without a reason: the whole product is priced on Haiku.
 //   - max_tokens capped (TASKS_AI_MAX_TOKENS, default 16000).
 //   - Per install per day: TASKS_AI_INSTALL_DAILY_USD (default 3.00).
 //   - Whole service per day: TASKS_AI_DAILY_USD (default 75.00).
@@ -48,7 +49,9 @@ const PRICES = {
   'claude-sonnet-5-5': [2, 10],
   'claude-opus-5-5': [4, 20],
 };
-const ALLOWED_MODELS = new Set(Object.keys(PRICES));
+const ALLOWED_MODELS = new Set(
+  String(process.env.TASKS_AI_MODELS || 'claude-haiku-5-5').split(',').map((s) => s.trim()).filter((m) => PRICES[m])
+);
 // Headers the SDK may send that Anthropic needs to see.
 const PASS_HEADERS = ['anthropic-version', 'anthropic-beta'];
 const CORS_HEADERS = [
@@ -127,7 +130,8 @@ module.exports = function createTasksAi({ apiKey }) {
 
     const body = req.body && typeof req.body === 'object' ? { ...req.body } : null;
     if (!body || !Array.isArray(body.messages)) return fail(res, 400, 'invalid_request_error', 'Missing messages.');
-    if (!ALLOWED_MODELS.has(body.model)) return fail(res, 400, 'invalid_request_error', `Model not available in AutoTasks: ${body.model}`);
+    if (!ALLOWED_MODELS.has(body.model)) return fail(res, 400, 'invalid_request_error', `AutoTasks writes with Claude Haiku only (asked for ${body.model}). Update AutoTasks.`);
+    if (body.speed) delete body.speed; // no fast mode: it bills double
     if (body.stream) return fail(res, 400, 'invalid_request_error', 'Streaming is not available in AutoTasks.');
     body.max_tokens = Math.min(Number(body.max_tokens) || MAX_TOKENS, MAX_TOKENS);
     // Server tools and MCP spend money outside the token count; AutoTasks never uses them.
