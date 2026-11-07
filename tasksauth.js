@@ -45,7 +45,7 @@ const PUBLISHABLE_KEY = process.env.TASKS_CLERK_PUBLISHABLE_KEY || '';
 const TTL_MS = 30 * 24 * 3600 * 1000;
 const PREFIX = 'att1';
 const STATUS_CACHE_MS = 60 * 1000;
-const NOT_ACTIVE = "You're signed up! Your AutoTasks account isn't turned on yet. Once it is, come back here and click Connect.";
+const NOT_ACTIVE = "You're signed up, but we don't have a payment for this account yet. AutoTasks unlocks once you've paid. After paying, come back here and click Connect.";
 
 function signingSecret(sessionSecret) {
   if (process.env.TASKS_SESSION_SECRET) return process.env.TASKS_SESSION_SECRET;
@@ -129,7 +129,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     const v = verify(token);
     if (!v.valid) return v;
     try {
-      if (!(await allowed(v.session))) return { valid: false, inactive: true, error: "This AutoTasks account isn't turned on" };
+      if (!(await allowed(v.session))) return { valid: false, inactive: true, error: "No payment yet. AutoTasks unlocks once you've paid" };
     } catch (e) {
       console.error('[tasksauth] status check failed:', e.message);
       return { valid: false, error: 'Could not check your account. Try again in a minute' };
