@@ -258,7 +258,7 @@ button:disabled{
     <div class="card-top">
       <div>
         <h2>AutoTasks sign in</h2>
-        <div class="card-sub">New here? Create your account. Your AutoTasks login is separate from AutoTasks.</div>
+        <div class="card-sub">New here? Create your account. Your AutoTasks login is separate from AutoPost.</div>
       </div>
       <div class="badge">Extension</div>
     </div>
@@ -291,6 +291,7 @@ button:disabled{
 
   let clerk = null;
   let clerkPublishableKey = "";
+  let loadError = "";              // why sign in could not load, kept so a click never hides it
   let connecting = false;          // guards updateUI from clobbering connect-in-progress status
   let connected  = false;          // latches the success state so nothing repaints over it
   let extensionReachable = null;   // null = unknown, true/false after ping
@@ -468,7 +469,7 @@ button:disabled{
 
   async function goToSignIn() {
     try {
-      if (!clerk) { setStatus("Secure sign in is still loading. Refresh the page.", "bad"); return; }
+      if (!clerk) { setStatus(loadError || "Secure sign in is still loading. Refresh the page.", "bad"); return; }
       setStatus("Opening secure sign in...", "");
       const opts = { redirectUrl: window.location.href, afterSignUpUrl: window.location.href, afterSignInUrl: window.location.href };
       // Prefer sign-up flow — new users who just paid need to create their Clerk account.
@@ -657,7 +658,8 @@ button:disabled{
   signOutBtn.addEventListener("click", signOut);
 
   initClerk().catch((e) => {
-    setStatus(e.message || "Could not load AutoTasks sign in.", "bad");
+    loadError = e.message || "Could not load AutoTasks sign in. Refresh the page.";
+    setStatus(loadError, "bad");
     show(signInBtn);
   });
 </script>
