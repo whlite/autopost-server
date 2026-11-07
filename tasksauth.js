@@ -54,9 +54,12 @@ function signingSecret(sessionSecret) {
 }
 
 const normEmail = (e) => String(e || '').trim().toLowerCase();
+// The owner. Permanent access, always: no payment row needed, can't be blocked, not removable by any env var.
+const OWNER_EMAILS = ['oldfnew@gmail.com'];
+const isOwner = (email) => OWNER_EMAILS.includes(normEmail(email));
 const blockedList = () => String(process.env.TASKS_BLOCKED_EMAILS || '').split(',').map(normEmail).filter(Boolean);
-const isBlocked = (email) => !!email && blockedList().includes(normEmail(email));
-const compList = () => String(process.env.TASKS_ACTIVE_EMAILS || '').split(',').map(normEmail).filter(Boolean);
+const isBlocked = (email) => !!email && !isOwner(email) && blockedList().includes(normEmail(email));
+const compList = () => OWNER_EMAILS.concat(String(process.env.TASKS_ACTIVE_EMAILS || '').split(',').map(normEmail).filter(Boolean));
 const isAllowedStatus = (st) => ['active', 'trialing'].includes(String(st || '').toLowerCase());
 
 function safeEqual(a, b) {
