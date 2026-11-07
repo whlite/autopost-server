@@ -465,6 +465,36 @@ async function upsertUserFromSubscription({ clerkUserId, email, stripeCustomerId
   }
 }
 
+// Is this Stripe purchase AutoTasks (not AutoPost)? By price id when TASKS_STRIPE_PRICE_IDS is set in Railway,
+// otherwise by the product's name ("AutoTasks", "Auto Tasks", "AutoPost Tasks"). AutoPost's products never match.
+const TASKS_STRIPE_PRICE_IDS = String(process.env.TASKS_STRIPE_PRICE_IDS || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+const TASKS_PRODUCT_RE = /auto\s*(post\s*)?tasks/i;
+const stripeProductNames = new Map();
+async function stripeProductName(product) {
+  const id = typeof product === 'string' ? product : product && product.id;
+  if (!id) return '';
+  if (product && typeof product === 'object' && product.name) return product.name;
+  if (!stripeProductNames.has(id)) {
+    let name = '';
+    try { name = (await stripe.products.retrieve(id)).name || ''; } catch (e) { console.error('Stripe product lookup failed:', e.message); }
+    stripeProductNames.set(id, name);
+  }
+  return stripeProductNames.get(id);
+}
+async function isAutoTasksPurchase(subscription, session) {
+  let prices = [];
+  if (subscription && subscription.items && subscription.items.data) prices = subscription.items.data.map(function (it) { return it.price || {}; });
+  else if (session && session.id) {
+    try { prices = (await stripe.checkout.sessions.listLineItems(session.id, { limit: 10 })).data.map(function (li) { return li.price || {}; }); }
+    catch (e) { console.error('Stripe line item lookup failed:', e.message); }
+  }
+  for (const p of prices) {
+    if (TASKS_STRIPE_PRICE_IDS.includes(p.id)) return true;
+    if (TASKS_PRODUCT_RE.test(await stripeProductName(p.product))) return true;
+  }
+  return false;
+}
+
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!stripe || !STRIPE_WEBHOOK_SECRET) {
@@ -482,6 +512,42 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     }
 
     console.log('Stripe webhook received:', event.type);
+
+    // AutoTasks shares this Stripe account. Its payments switch on AutoTasks (autotasks_users) and must never
+    // switch on AutoPost, so every event is checked for which product it's for first.
+    if (event.type === 'checkout.session.completed') {
+      const s0 = event.data.object;
+      const sub0 = s0.subscription ? await stripe.subscriptions.retrieve(s0.subscription) : null;
+      if (await isAutoTasksPurchase(sub0, s0)) {
+        const email = (s0.customer_details && s0.customer_details.email) || (s0.metadata && s0.metadata.email);
+        await tasksAuth.applyStripe({
+          email, status: sub0 ? sub0.status : 'active', customerId: s0.customer, subscriptionId: s0.subscription,
+          periodEnd: sub0 && sub0.current_period_end ? new Date(sub0.current_period_end * 1000) : null
+        });
+        notify.captureLead({
+          email, name: s0.customer_details && s0.customer_details.name, phone: s0.customer_details && s0.customer_details.phone,
+          source: 'autotasks', notes: 'Paid AutoTasks ($100/mo). Switched on automatically.'
+        }).catch(function (e) { console.error('Notify capture (autotasks stripe) error:', e.message); });
+        return res.json({ received: true });
+      }
+    }
+    if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      if (await isAutoTasksPurchase(sub, null)) {
+        await tasksAuth.applyStripe({
+          email: sub.metadata && sub.metadata.email, status: event.type === 'customer.subscription.deleted' ? 'canceled' : sub.status,
+          customerId: sub.customer, subscriptionId: sub.id,
+          periodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null
+        });
+        return res.json({ received: true });
+      }
+    }
+    if (event.type === 'invoice.payment_failed') {
+      const inv = event.data.object;
+      if (inv.subscription && pool) {
+        await pool.query(`UPDATE autotasks_users SET subscription_status = 'past_due', updated_at = NOW() WHERE stripe_subscription_id = $1`, [inv.subscription]).catch(function () {});
+      }
+    }
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;

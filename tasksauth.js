@@ -94,8 +94,44 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         last_seen_at TIMESTAMPTZ
-      );`).catch((e) => { schemaReady = null; throw e; });
+      );`)
+      .then(() => pool.query(`ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;`))
+      .catch((e) => { schemaReady = null; throw e; });
     return schemaReady;
+  }
+
+  // ---- Stripe: an AutoTasks payment turns the buyer on (and a cancel or failed payment turns them off).
+  // Called by server.js's Stripe webhook only for AutoTasks products, so AutoPost payments never land here
+  // and AutoTasks payments never switch on AutoPost. Matched by subscription id first, then by email, so it
+  // works whether they pay before or after creating their AutoTasks login.
+  async function applyStripe({ email, status, customerId, subscriptionId, periodEnd }) {
+    if (!pool) return null;
+    await initSchema();
+    const em = normEmail(email);
+    const st = String(status || 'inactive').toLowerCase();
+    let r = { rows: [] };
+    if (subscriptionId) {
+      r = await pool.query(
+        `UPDATE autotasks_users SET subscription_status = $2, stripe_customer_id = COALESCE($3, stripe_customer_id),
+           current_period_end = COALESCE($4, current_period_end), updated_at = NOW()
+         WHERE stripe_subscription_id = $1 RETURNING email`, [subscriptionId, st, customerId || null, periodEnd || null]);
+    }
+    if (!r.rows.length && em) {
+      r = await pool.query(
+        `INSERT INTO autotasks_users (email, subscription_status, stripe_customer_id, stripe_subscription_id, current_period_end)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (email) DO UPDATE SET subscription_status = EXCLUDED.subscription_status,
+           stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, autotasks_users.stripe_customer_id),
+           stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, autotasks_users.stripe_subscription_id),
+           current_period_end = COALESCE(EXCLUDED.current_period_end, autotasks_users.current_period_end),
+           updated_at = NOW()
+         RETURNING email`, [em, st, customerId || null, subscriptionId || null, periodEnd || null]);
+    }
+    statusCache.clear(); // the change applies on their next panel open or AI call, not a minute later
+    console.log('[tasksauth] Stripe', st, 'for', (r.rows[0] && r.rows[0].email) || em || subscriptionId);
+    return r.rows[0] || null;
   }
 
   // First sign-in creates the row (inactive) and alerts the owner. Returns { status, created }.
@@ -236,5 +272,5 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   });
 
   initSchema().catch((e) => console.error('[tasksauth] could not create autotasks_users:', e.message));
-  return { router, verify, check };
+  return { router, verify, check, applyStripe };
 };
