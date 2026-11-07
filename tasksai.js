@@ -133,7 +133,8 @@ module.exports = function createTasksAi({ apiKey, verifyUser }) {
     const sent = String(req.get('x-api-key') || req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
     let install = '';
     if (sent.startsWith('att1.') && verifyUser) {
-      const v = verifyUser(sent);
+      const v = await verifyUser(sent); // signature, expiry AND an active account in Neon
+      if (!v.valid && v.inactive) return fail(res, 403, 'permission_error', `${v.error}.`);
       if (!v.valid) return fail(res, 401, 'authentication_error', `Sign in to AutoTasks again (${v.error.toLowerCase()}).`);
       install = 'u:' + v.session.sub; // caps follow the person, on any computer
       if (BLOCKED.has(v.session.email)) return fail(res, 403, 'permission_error', 'This AutoTasks account is turned off.');

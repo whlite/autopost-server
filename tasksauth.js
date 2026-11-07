@@ -20,8 +20,14 @@
 //   6. The extension sends that token as its "API key" to the AI relay (tasksai.js), which checks it here,
 //      and re-checks it on every panel open with  POST /api/tasks/auth/verify.
 //
-// ACCESS
-//   Any signed-in AutoTasks account gets in, except emails in TASKS_BLOCKED_EMAILS (comma-separated).
+// ACCESS (same rule as AutoPost: signing in proves WHO you are, not THAT you're allowed in)
+//   Every AutoTasks sign-in gets a row in Neon table  autotasks_users  (subscription_status starts 'inactive')
+//   and the owner gets a signup alert (notify.js, source 'autotasks'). Only 'active' or 'trialing' unlocks
+//   AutoTasks. The owner turns someone on in Neon:
+//     UPDATE autotasks_users SET subscription_status = 'active', updated_at = NOW() WHERE email = 'rep@x.com';
+//   Owner comps without a row edit: TASKS_ACTIVE_EMAILS (comma-separated). Blocks: TASKS_BLOCKED_EMAILS.
+//   Status is re-checked on every panel open and every AI call (cached 60s), so switching someone back to
+//   'inactive' cuts them off within a minute. No database = nobody gets in.
 //
 // ROUTES
 //   GET  /tasks/login                    the sign-in page
@@ -38,6 +44,8 @@ const SECRET_KEY = process.env.TASKS_CLERK_SECRET_KEY || '';
 const PUBLISHABLE_KEY = process.env.TASKS_CLERK_PUBLISHABLE_KEY || '';
 const TTL_MS = 30 * 24 * 3600 * 1000;
 const PREFIX = 'att1';
+const STATUS_CACHE_MS = 60 * 1000;
+const NOT_ACTIVE = "You're signed up! Your AutoTasks account isn't turned on yet. Once it is, come back here and click Connect.";
 
 function signingSecret(sessionSecret) {
   if (process.env.TASKS_SESSION_SECRET) return process.env.TASKS_SESSION_SECRET;
@@ -48,6 +56,8 @@ function signingSecret(sessionSecret) {
 const normEmail = (e) => String(e || '').trim().toLowerCase();
 const blockedList = () => String(process.env.TASKS_BLOCKED_EMAILS || '').split(',').map(normEmail).filter(Boolean);
 const isBlocked = (email) => !!email && blockedList().includes(normEmail(email));
+const compList = () => String(process.env.TASKS_ACTIVE_EMAILS || '').split(',').map(normEmail).filter(Boolean);
+const isAllowedStatus = (st) => ['active', 'trialing'].includes(String(st || '').toLowerCase());
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
@@ -55,7 +65,7 @@ function safeEqual(a, b) {
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-module.exports = function createTasksAuth({ sessionSecret }) {
+module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   const SECRET = signingSecret(sessionSecret);
   const clerk = SECRET_KEY ? createClerkClient({ secretKey: SECRET_KEY }) : null;
   const router = express.Router();
@@ -66,7 +76,68 @@ module.exports = function createTasksAuth({ sessionSecret }) {
     return `${PREFIX}.${body}.${sig}`;
   };
 
-  /** An AutoTasks token -> { valid, session } or { valid: false, error }. */
+  // ---- Neon: who is allowed in
+  let schemaReady = null;
+  function initSchema() {
+    if (!pool) return Promise.resolve();
+    schemaReady ||= pool.query(`
+      CREATE TABLE IF NOT EXISTS autotasks_users (
+        id SERIAL PRIMARY KEY,
+        clerk_user_id TEXT UNIQUE,
+        email TEXT UNIQUE,
+        name TEXT,
+        subscription_status TEXT DEFAULT 'inactive',
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ
+      );`).catch((e) => { schemaReady = null; throw e; });
+    return schemaReady;
+  }
+
+  // First sign-in creates the row (inactive) and alerts the owner. Returns { status, created }.
+  async function upsertUser({ sub, email, name }) {
+    await initSchema();
+    const found = await pool.query(
+      `UPDATE autotasks_users SET clerk_user_id = COALESCE(clerk_user_id, $1), name = COALESCE(NULLIF($3, ''), name),
+         last_seen_at = NOW() WHERE clerk_user_id = $1 OR LOWER(email) = $2 RETURNING subscription_status`,
+      [sub, email, name]);
+    if (found.rows.length) return { status: found.rows[0].subscription_status, created: false };
+    const made = await pool.query(
+      `INSERT INTO autotasks_users (clerk_user_id, email, name, last_seen_at) VALUES ($1, $2, $3, NOW())
+       ON CONFLICT DO NOTHING RETURNING subscription_status`, [sub, email, name]);
+    return { status: made.rows[0] ? made.rows[0].subscription_status : 'inactive', created: !!made.rows[0] };
+  }
+
+  const statusCache = new Map(); // sub -> { ok, at }
+  /** Is this signed-in person allowed in right now? */
+  async function allowed(session) {
+    if (compList().includes(normEmail(session.email))) return true;
+    if (!pool) return false;
+    const hit = statusCache.get(session.sub);
+    if (hit && Date.now() - hit.at < STATUS_CACHE_MS) return hit.ok;
+    await initSchema();
+    const r = await pool.query('SELECT subscription_status FROM autotasks_users WHERE clerk_user_id = $1 OR LOWER(email) = $2 LIMIT 1',
+      [session.sub, normEmail(session.email)]);
+    const ok = !!r.rows[0] && isAllowedStatus(r.rows[0].subscription_status);
+    statusCache.set(session.sub, { ok, at: Date.now() });
+    return ok;
+  }
+
+  /** Token AND an active account: { valid, session } or { valid: false, error, inactive? }. */
+  async function check(token) {
+    const v = verify(token);
+    if (!v.valid) return v;
+    try {
+      if (!(await allowed(v.session))) return { valid: false, inactive: true, error: "This AutoTasks account isn't turned on" };
+    } catch (e) {
+      console.error('[tasksauth] status check failed:', e.message);
+      return { valid: false, error: 'Could not check your account. Try again in a minute' };
+    }
+    return v;
+  }
+
+  /** An AutoTasks token -> { valid, session } or { valid: false, error }. Signature and expiry only. */
   function verify(token) {
     const parts = String(token || '').trim().split('.');
     if (parts.length !== 3 || parts[0] !== PREFIX) return { valid: false, error: 'Not an AutoTasks sign-in' };
@@ -113,6 +184,25 @@ module.exports = function createTasksAuth({ sessionSecret }) {
       if (!email) return res.status(400).json({ success: false, error: 'Could not read your email. Sign in again.' });
       if (isBlocked(email)) return res.status(403).json({ success: false, error: 'This AutoTasks account is turned off.' });
       const name = [u.firstName, u.lastName].filter(Boolean).join(' ');
+      if (!pool && !compList().includes(email)) {
+        return res.status(503).json({ success: false, error: 'AutoTasks accounts are unavailable. Try again in a minute.' });
+      }
+      if (pool) {
+        const row = await upsertUser({ sub: claims.sub, email, name });
+        statusCache.delete(claims.sub);
+        if (row.created) {
+          console.log('[tasksauth] NEW signup (inactive):', email);
+          if (notify && notify.captureLead) {
+            notify.captureLead({ email, name, source: 'autotasks',
+              notes: `AutoTasks signup waiting. Turn on: UPDATE autotasks_users SET subscription_status='active' WHERE email='${email}';` })
+              .catch((e) => console.error('[tasksauth] signup alert failed:', e.message));
+          }
+        }
+        if (!isAllowedStatus(row.status) && !compList().includes(email)) {
+          console.log('[tasksauth] DENIED (status ' + row.status + ') for', email);
+          return res.status(402).json({ success: false, error: NOT_ACTIVE });
+        }
+      }
       const session = { app: 'autotasks', sub: claims.sub, email, name, iat: Date.now(), exp: Date.now() + TTL_MS };
       console.log('[tasksauth] signed in', email);
       return res.json({ success: true, token: sign(session), expiresInSeconds: TTL_MS / 1000, user: { email, name } });
@@ -122,10 +212,10 @@ module.exports = function createTasksAuth({ sessionSecret }) {
     }
   });
 
-  router.post('/api/tasks/auth/verify', express.json({ limit: '16kb' }), (req, res) => {
+  router.post('/api/tasks/auth/verify', express.json({ limit: '16kb' }), async (req, res) => {
     const token = (req.body && req.body.token) || String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-    const v = verify(token);
-    if (!v.valid) return res.status(401).json({ valid: false, error: v.error });
+    const v = await check(token);
+    if (!v.valid) return res.status(v.inactive ? 402 : 401).json({ valid: false, inactive: !!v.inactive, error: v.error });
     return res.json({ valid: true, user: { email: v.session.email, name: v.session.name || '' }, expiresAt: v.session.exp });
   });
 
@@ -137,5 +227,6 @@ module.exports = function createTasksAuth({ sessionSecret }) {
     res.sendFile(path.join(__dirname, 'public', 'tasks-login.html'));
   });
 
-  return { router, verify };
+  initSchema().catch((e) => console.error('[tasksauth] could not create autotasks_users:', e.message));
+  return { router, verify, check };
 };

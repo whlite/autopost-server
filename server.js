@@ -560,9 +560,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 // Anthropic SDK sends its own headers (x-api-key, anthropic-*, x-stainless-*).
 // AutoTasks sign-in: its own Clerk application (TASKS_CLERK_*), so it is mounted before AutoPost's clerkMiddleware
 // and never shares accounts or tokens with AutoPost.
-const tasksAuth = createTasksAuth({ sessionSecret: SESSION_SECRET });
+const tasksAuth = createTasksAuth({ sessionSecret: SESSION_SECRET, pool, notify });
 app.use(tasksAuth.router);
-app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY, verifyUser: tasksAuth.verify }));
+app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY, verifyUser: tasksAuth.check }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(clerkMiddleware());
