@@ -1,4 +1,4 @@
-// tasksai.js - the AI relay for AutoTasks (the VinSolutions task extension).
+// tasksai.js - the AI relay for AutoTasks (the CRM task extension).
 //
 // WHY IT RUNS HERE
 //   AutoTasks used to ship with a Claude API key inside config.js. Anyone who
@@ -182,7 +182,8 @@ module.exports = function createTasksAi({ apiKey, verifyUser }) {
         usage.calls += 1;
         usage.perInstall.set(install, mine + spent);
       }
-      if (!up.ok) console.error('[tasksai] upstream', up.status, text.slice(0, 300));
+      // Privacy: never log message text. Only the status and Anthropic's error type, which hold no customer data.
+      if (!up.ok) console.error('[tasksai] upstream', up.status, (json && json.error && json.error.type) || 'error');
       for (const h of ['request-id', 'retry-after']) {
         const v = up.headers.get(h);
         if (v) res.set(h, v);

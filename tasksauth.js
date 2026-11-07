@@ -230,6 +230,11 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     res.sendFile(path.join(__dirname, 'public', 'tasks-login.html'));
   });
 
+  // AutoTasks privacy policy (the Chrome Web Store listing links here).
+  router.get(['/tasks/privacy', '/tasks/privacy.html'], (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'tasks-privacy.html'));
+  });
+
   initSchema().catch((e) => console.error('[tasksauth] could not create autotasks_users:', e.message));
   return { router, verify, check };
 };
