@@ -34,6 +34,11 @@
 //   GET  /api/tasks/auth/config          { configured, publishableKey }
 //   POST /api/tasks/auth/create-token    Clerk session JWT -> { token, expiresInSeconds, user }
 //   POST /api/tasks/auth/verify          { token } -> { valid, user }
+//   POST /api/tasks/signup               the website's signup form: creates their AutoTasks login (Clerk,
+//                                        no password: they sign in with an emailed code), saves name, phone,
+//                                        dealership and CRM on their autotasks_users row (inactive until
+//                                        Stripe says paid), alerts the owner, returns the Stripe checkout
+//                                        link with their email filled in. TASKS_STRIPE_LINK overrides the link.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -97,7 +102,11 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
       );`)
       .then(() => pool.query(`ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
         ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
-        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;`))
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS phone TEXT;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS dealership TEXT;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS dealer_website TEXT;
+        ALTER TABLE autotasks_users ADD COLUMN IF NOT EXISTS crm TEXT;`))
       .catch((e) => { schemaReady = null; throw e; });
     return schemaReady;
   }
@@ -106,7 +115,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   // Called by server.js's Stripe webhook only for AutoTasks products, so AutoPost payments never land here
   // and AutoTasks payments never switch on AutoPost. Matched by subscription id first, then by email, so it
   // works whether they pay before or after creating their AutoTasks login.
-  async function applyStripe({ email, status, customerId, subscriptionId, periodEnd }) {
+  async function applyStripe({ email, status, customerId, subscriptionId, periodEnd, clerkUserId }) {
     if (!pool) return null;
     await initSchema();
     const em = normEmail(email);
@@ -117,6 +126,14 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
         `UPDATE autotasks_users SET subscription_status = $2, stripe_customer_id = COALESCE($3, stripe_customer_id),
            current_period_end = COALESCE($4, current_period_end), updated_at = NOW()
          WHERE stripe_subscription_id = $1 RETURNING email`, [subscriptionId, st, customerId || null, periodEnd || null]);
+    }
+    // Paid with a different email than they signed up with: the signup page's Clerk id still finds them.
+    if (!r.rows.length && /^user_[A-Za-z0-9]+$/.test(String(clerkUserId || ''))) {
+      r = await pool.query(
+        `UPDATE autotasks_users SET subscription_status = $2, stripe_customer_id = COALESCE($3, stripe_customer_id),
+           stripe_subscription_id = COALESCE($4, stripe_subscription_id), current_period_end = COALESCE($5, current_period_end),
+           updated_at = NOW()
+         WHERE clerk_user_id = $1 RETURNING email`, [clerkUserId, st, customerId || null, subscriptionId || null, periodEnd || null]);
     }
     if (!r.rows.length && em) {
       r = await pool.query(
@@ -191,7 +208,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     return { valid: true, session };
   }
 
-  router.use(['/api/tasks/auth', '/tasks/login'], (req, res, next) => {
+  router.use(['/api/tasks/auth', '/api/tasks/signup', '/tasks/login'], (req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -248,6 +265,69 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     } catch (e) {
       console.error('[tasksauth] create-token error:', e.message);
       return res.status(500).json({ success: false, error: 'Server error. Try again.' });
+    }
+  });
+
+  // ---- website signup: create the login + save their info, then send them to Stripe
+  const STRIPE_LINK = process.env.TASKS_STRIPE_LINK || 'https://buy.stripe.com/dRmbJ193c0tvb2e3Rr4gg05';
+  const signupHits = new Map(); // ip -> [times], a light brake on bots
+  const clean = (v, max = 200) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, max);
+  router.post('/api/tasks/signup', express.json({ limit: '16kb' }), async (req, res) => {
+    const b = req.body || {};
+    if (b.company_site) return res.json({ success: true, checkoutUrl: STRIPE_LINK }); // honeypot: bots get the plain link
+    const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    const now = Date.now();
+    const hits = (signupHits.get(ip) || []).filter((t) => now - t < 3600000);
+    if (hits.length >= 12) return res.status(429).json({ success: false, error: 'Too many tries. Wait a few minutes and try again.' });
+    signupHits.set(ip, hits.concat(now));
+
+    const first = clean(b.first_name, 60), last = clean(b.last_name, 60);
+    const email = normEmail(clean(b.email, 200));
+    const phone = clean(b.phone, 40), dealership = clean(b.dealership, 160), website = clean(b.dealer_website, 300);
+    const crm = clean(b.crm, 80) || 'VinSolutions';
+    if (!first || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, error: 'Add your name and a valid email.' });
+    }
+    if (isBlocked(email)) return res.status(403).json({ success: false, error: 'This email can\'t sign up. Contact tryautopost@gmail.com.' });
+    if (!clerk) return res.status(503).json({ success: false, error: 'Sign up is down for a minute. Try again shortly.' });
+
+    try {
+      // Their AutoTasks login: reuse it if this email already has one, otherwise create it (no password;
+      // AutoTasks sign-in emails them a code).
+      let user = null;
+      const found = await clerk.users.getUserList({ emailAddress: [email], limit: 1 });
+      user = (found && (found.data || found))[0] || null;
+      if (!user) {
+        user = await clerk.users.createUser({
+          emailAddress: [email], firstName: first, lastName: last || undefined,
+          skipPasswordRequirement: true, skipPasswordChecks: true,
+        });
+        console.log('[tasksauth] signup: created login for', email);
+      }
+      const name = [first, last].filter(Boolean).join(' ');
+      if (pool) {
+        await initSchema();
+        await pool.query(
+          `INSERT INTO autotasks_users (clerk_user_id, email, name, phone, dealership, dealer_website, crm, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (email) DO UPDATE SET clerk_user_id = COALESCE(autotasks_users.clerk_user_id, EXCLUDED.clerk_user_id),
+             name = EXCLUDED.name, phone = COALESCE(NULLIF(EXCLUDED.phone, ''), autotasks_users.phone),
+             dealership = COALESCE(NULLIF(EXCLUDED.dealership, ''), autotasks_users.dealership),
+             dealer_website = COALESCE(NULLIF(EXCLUDED.dealer_website, ''), autotasks_users.dealer_website),
+             crm = EXCLUDED.crm, updated_at = NOW()`,
+          [user.id, email, name, phone, dealership, website, crm]);
+      }
+      if (notify && notify.captureLead) {
+        notify.captureLead({ email, name, phone, dealership, dealer_website: website, source: 'autotasks',
+          notes: `AutoTasks signup (CRM: ${crm}). Sent to Stripe checkout; turns on automatically when paid.` })
+          .catch((e) => console.error('[tasksauth] signup alert failed:', e.message));
+      }
+      const q = new URLSearchParams({ prefilled_email: email, client_reference_id: user.id });
+      return res.json({ success: true, checkoutUrl: `${STRIPE_LINK}?${q}` });
+    } catch (e) {
+      const msg = (e && e.errors && e.errors[0] && (e.errors[0].longMessage || e.errors[0].message)) || e.message;
+      console.error('[tasksauth] signup error:', msg);
+      return res.status(500).json({ success: false, error: 'We couldn\'t create your login. Try again, or email tryautopost@gmail.com.' });
     }
   });
 

@@ -522,6 +522,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const email = (s0.customer_details && s0.customer_details.email) || (s0.metadata && s0.metadata.email);
         await tasksAuth.applyStripe({
           email, status: sub0 ? sub0.status : 'active', customerId: s0.customer, subscriptionId: s0.subscription,
+          clerkUserId: s0.client_reference_id,
           periodEnd: sub0 && sub0.current_period_end ? new Date(sub0.current_period_end * 1000) : null
         });
         notify.captureLead({
