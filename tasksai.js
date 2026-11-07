@@ -21,7 +21,9 @@
 //   - Cost is measured from the usage Anthropic returns, at list prices.
 //   - Days roll over at midnight TASKS_AI_TZ (default America/Denver).
 //   - Kill switch: TASKS_AI_OFF=1.
-//   - Blocks: TASKS_AI_BLOCKED_INSTALLS (comma-separated install ids).
+//   - Blocks: TASKS_AI_BLOCKED_INSTALLS (comma-separated install ids or account emails).
+//   - Sign-in: 1.2+ sends an AutoTasks token (tasksauth.js), capped per person. TASKS_AUTH_REQUIRED=1 refuses
+//     the old bare install ids.
 //   Counts are in memory: a redeploy resets the day, which only ever errs
 //   toward letting reps keep working.
 //
@@ -41,6 +43,8 @@ const DAY_TZ = process.env.TASKS_AI_TZ || 'America/Denver';
 const OFF = /^(1|true|yes|on)$/i.test(String(process.env.TASKS_AI_OFF || ''));
 const BLOCKED = new Set(String(process.env.TASKS_AI_BLOCKED_INSTALLS || '').split(',').map((s) => s.trim()).filter(Boolean));
 const INSTALL_RE = /^at_[a-f0-9]{32}$/;
+// Once every rep is on AutoTasks 1.2+ (sign-in), set TASKS_AUTH_REQUIRED=1 so bare install ids stop working.
+const AUTH_REQUIRED = /^(1|true|yes|on)$/i.test(String(process.env.TASKS_AUTH_REQUIRED || ''));
 const TIMEOUT_MS = 120000;
 
 // Dollars per million tokens: [input, output]. Fast mode (speed: "fast") is 2x on Opus.
@@ -92,7 +96,7 @@ function fail(res, status, type, message, retry = status >= 500) {
   return res.status(status).json({ type: 'error', error: { type, message } });
 }
 
-module.exports = function createTasksAi({ apiKey }) {
+module.exports = function createTasksAi({ apiKey, verifyUser }) {
   const router = express.Router();
 
   router.use('/api/tasks', (req, res, next) => {
@@ -115,6 +119,7 @@ module.exports = function createTasksAi({ apiKey }) {
       installDailyUsd: INSTALL_DAILY_USD,
       installs: usage.perInstall.size,
       calls: usage.calls,
+      authRequired: AUTH_REQUIRED,
     });
   });
 
@@ -124,8 +129,19 @@ module.exports = function createTasksAi({ apiKey }) {
     if (OFF) return fail(res, 503, 'overloaded_error', 'AutoTasks AI is paused for a moment. Try again soon.');
 
     // The SDK sends the install id as x-api-key, or as a Bearer token when pointed at a custom server.
-    const install = String(req.get('x-api-key') || req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    if (!INSTALL_RE.test(install)) return fail(res, 401, 'authentication_error', 'AutoTasks could not identify this install. Reload the extension.');
+    // AutoTasks 1.2+ sends the rep's AutoTasks sign-in token (tasksauth.js); older builds send a bare install id.
+    const sent = String(req.get('x-api-key') || req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    let install = '';
+    if (sent.startsWith('att1.') && verifyUser) {
+      const v = verifyUser(sent);
+      if (!v.valid) return fail(res, 401, 'authentication_error', `Sign in to AutoTasks again (${v.error.toLowerCase()}).`);
+      install = 'u:' + v.session.sub; // caps follow the person, on any computer
+      if (BLOCKED.has(v.session.email)) return fail(res, 403, 'permission_error', 'This AutoTasks account is turned off.');
+    } else {
+      if (AUTH_REQUIRED) return fail(res, 401, 'authentication_error', 'Sign in to AutoTasks to keep writing. Update AutoTasks if there is no Sign in button.');
+      if (!INSTALL_RE.test(sent)) return fail(res, 401, 'authentication_error', 'AutoTasks could not identify this install. Reload the extension.');
+      install = sent;
+    }
     if (BLOCKED.has(install)) return fail(res, 403, 'permission_error', 'This AutoTasks install is turned off.');
 
     const body = req.body && typeof req.body === 'object' ? { ...req.body } : null;

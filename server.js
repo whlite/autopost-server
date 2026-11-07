@@ -10,6 +10,7 @@ const createOperator = require('./operator');
 const createPhotoScene = require('./photoscene');
 const createProspecting = require('./prospecting');
 const createTasksAi = require('./tasksai');
+const createTasksAuth = require('./tasksauth');
 
 const app = express();
 
@@ -54,6 +55,7 @@ console.log('AI key loaded:', !!ANTHROPIC_API_KEY);
 console.log('SESSION_SECRET loaded:', !!SESSION_SECRET);
 console.log('CLERK_SECRET_KEY loaded:', !!process.env.CLERK_SECRET_KEY);
 console.log('CLERK_PUBLISHABLE_KEY loaded:', !!process.env.CLERK_PUBLISHABLE_KEY);
+console.log('TASKS_CLERK keys loaded (AutoTasks sign-in):', !!process.env.TASKS_CLERK_SECRET_KEY, !!process.env.TASKS_CLERK_PUBLISHABLE_KEY);
 console.log('STRIPE_SECRET_KEY loaded:', !!STRIPE_SECRET_KEY);
 console.log('STRIPE_WEBHOOK_SECRET loaded:', !!STRIPE_WEBHOOK_SECRET);
 console.log('STRIPE_PRICE_SOLO loaded:', !!STRIPE_PRICE_SOLO);
@@ -556,7 +558,11 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
 // AutoTasks AI relay: mounted before the global JSON/CORS middleware because the
 // Anthropic SDK sends its own headers (x-api-key, anthropic-*, x-stainless-*).
-app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY }));
+// AutoTasks sign-in: its own Clerk application (TASKS_CLERK_*), so it is mounted before AutoPost's clerkMiddleware
+// and never shares accounts or tokens with AutoPost.
+const tasksAuth = createTasksAuth({ sessionSecret: SESSION_SECRET });
+app.use(tasksAuth.router);
+app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY, verifyUser: tasksAuth.verify }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(clerkMiddleware());

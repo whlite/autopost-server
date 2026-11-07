@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>AutoTasks Sign In</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg:        #000000;
+  --white:     #f4efe2;
+  --text:      rgba(244,239,226,0.84);
+  --text2:     rgba(244,239,226,0.62);
+  --text3:     rgba(244,239,226,0.40);
+  --text4:     rgba(244,239,226,0.22);
+  --accent:      #2ee6c8;
+  --accent-deep: #18c9b4;
+  --accent-soft:  rgba(46,230,200,0.12);
+  --accent-glow: rgba(46,230,200,0.45);
+
+  /* ── Signature spectrum — the AT mark's sweep: lime → green → teal → cyan → blue ── */
+  --c1: #c6f432;
+  --c2: #3fe08a;
+  --c3: #18c9b4;
+  --c4: #2fb6f0;
+  --c5: #5b7cfa;
+  --grad:      linear-gradient(100deg,#c6f432 0%,#3fe08a 26%,#18c9b4 50%,#2fb6f0 74%,#5b7cfa 100%);
+  --grad-soft: linear-gradient(100deg,rgba(198,244,50,.14) 0%,rgba(24,201,180,.16) 50%,rgba(91,124,250,.16) 100%);
+  --card-bd:   rgba(255,255,255,0.08);
+}
+
+html{scroll-behavior:smooth}
+
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+  background:var(--bg);
+  color:var(--text2);
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+  letter-spacing:-0.01em;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:80px 28px 40px;
+}
+
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background:#000;
+  z-index:-3;pointer-events:none;
+}
+
+/* ── NAV ── */
+nav{
+  position:fixed;top:0;left:0;right:0;z-index:900;
+  height:64px;padding:0 40px;
+  display:flex;align-items:center;
+  background:rgba(0,0,0,0.72);
+  backdrop-filter:blur(28px) saturate(160%);
+  -webkit-backdrop-filter:blur(28px) saturate(160%);
+  border-bottom:1px solid rgba(255,255,255,0.06);
+}
+.logo{font-size:20px;font-weight:700;letter-spacing:-.055em;text-decoration:none;display:flex;align-items:center}
+.logo .a{color:var(--white)}
+.logo .p{background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
+
+/* ── LAYOUT ── */
+.page{
+  width:100%;
+  max-width:1020px;
+  display:grid;
+  grid-template-columns:1fr 400px;
+  gap:48px;
+  align-items:center;
+}
+
+/* ── HERO SIDE ── */
+.hero{padding:20px}
+
+.hero-logo{
+  display:inline-flex;align-items:center;gap:10px;
+  margin-bottom:32px;
+  padding:8px 16px;
+  border-radius:999px;
+  background:var(--grad-soft);
+  border:1px solid rgba(255,255,255,0.12);
+  font-size:14px;font-weight:600;color:var(--white);
+  letter-spacing:-.03em;
+}
+
+h1{
+  font-size:clamp(36px,5vw,60px);
+  font-weight:700;
+  color:var(--white);
+  letter-spacing:-0.05em;
+  line-height:1.05;
+  margin-bottom:20px;
+}
+
+.hero p{
+  font-size:16px;
+  color:var(--text2);
+  line-height:1.7;
+  max-width:480px;
+}
+
+.features{display:flex;flex-wrap:wrap;gap:8px;margin-top:28px}
+.feature{
+  font-size:12px;font-weight:600;
+  color:var(--text2);
+  padding:7px 14px;border-radius:999px;
+  background:rgba(255,255,255,0.05);
+  border:1px solid rgba(255,255,255,0.09);
+  letter-spacing:.01em;
+}
+
+/* ── CARD ── */
+.card{
+  background:linear-gradient(145.37deg,rgba(255,255,255,0.07) -8.75%,rgba(255,255,255,0.022) 83.95%);
+  border:1px solid rgba(255,255,255,0.09);
+  border-radius:22px;
+  padding:30px;
+  box-shadow:0 30px 80px rgba(0,0,0,0.6),0 0 0 1px rgba(46,230,200,0.05);
+}
+
+.card-top{
+  display:flex;justify-content:space-between;align-items:flex-start;
+  gap:14px;margin-bottom:20px;
+}
+
+.card h2{
+  font-size:22px;font-weight:700;
+  color:var(--white);letter-spacing:-0.04em;
+  line-height:1.1;margin-bottom:6px;
+}
+
+.card-sub{
+  font-size:13px;color:var(--text3);line-height:1.5;
+}
+
+.badge{
+  white-space:nowrap;font-size:11px;text-transform:uppercase;
+  letter-spacing:.08em;font-weight:700;
+  padding:6px 10px;border-radius:999px;
+  color:var(--accent);
+  background:rgba(46,230,200,0.1);
+  border:1px solid rgba(46,230,200,0.2);
+}
+
+/* ── STATUS ── */
+.status{
+  border-radius:12px;padding:13px 16px;
+  font-size:13px;line-height:1.5;
+  margin:16px 0;
+  color:var(--text2);
+  background:rgba(255,255,255,0.04);
+  border:1px solid rgba(255,255,255,0.07);
+}
+.status.good{
+  color:rgba(46,230,200,0.9);
+  background:rgba(46,230,200,0.08);
+  border-color:rgba(46,230,200,0.2);
+}
+.status.bad{
+  color:rgba(248,113,113,0.9);
+  background:rgba(248,113,113,0.08);
+  border-color:rgba(248,113,113,0.2);
+}
+
+/* ── ACTIONS ── */
+.actions{display:grid;gap:10px;margin-top:12px}
+
+button,a.button{
+  width:100%;border:0;border-radius:14px;
+  padding:14px 18px;font-size:14px;font-weight:600;
+  cursor:pointer;text-decoration:none;text-align:center;
+  transition:.18s ease;font-family:'Inter',sans-serif;
+  letter-spacing:-.02em;
+}
+
+button:hover,a.button:hover{
+  transform:translateY(-1px);
+}
+
+button:disabled{
+  opacity:.45;cursor:not-allowed;transform:none;
+}
+
+.primary{
+  color:#07090b;
+  background:var(--grad);
+  box-shadow:0 8px 28px rgba(24,201,180,0.30),inset 0 1px 0 rgba(255,255,255,0.2);
+}
+.primary:hover{filter:brightness(1.08);box-shadow:0 12px 36px rgba(24,201,180,0.40)}
+
+.secondary{
+  color:var(--text2);
+  background:rgba(255,255,255,0.06);
+  border:1px solid rgba(255,255,255,0.09);
+}
+.secondary:hover{background:rgba(255,255,255,0.09);color:var(--white)}
+
+.hidden{display:none !important}
+
+.foot{
+  margin-top:18px;text-align:center;
+  font-size:12px;color:var(--text3);line-height:1.5;
+}
+
+/* ── RESPONSIVE ── */
+@media(max-width:860px){
+  .page{grid-template-columns:1fr;max-width:480px}
+  .hero{text-align:center;padding:0}
+  .hero p,.hero-logo{margin-left:auto;margin-right:auto}
+  .features{justify-content:center}
+  h1{font-size:clamp(30px,7vw,48px)}
+}
+
+@media(max-width:480px){
+  body{padding:72px 16px 32px}
+  .card{border-radius:18px;padding:22px}
+  .card-top{flex-direction:column}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="logo">
+    <span><span class="a">Auto</span><span class="p">Tasks</span></span>
+  </span>
+</nav>
+
+<div class="page">
+
+  <section class="hero">
+    <div class="hero-logo">AutoTasks</div>
+
+    <h1>Connect your<br>extension.</h1>
+
+    <p>Sign in with your AutoTasks account and we'll unlock the AutoTasks side panel in VinSolutions automatically.</p>
+
+    <div class="features">
+      <div class="feature">Secure account access</div>
+      <div class="feature">Your own AutoTasks login</div>
+      <div class="feature">Extension ready</div>
+    </div>
+  </section>
+
+  <main class="card">
+    <div class="card-top">
+      <div>
+        <h2>AutoTasks sign in</h2>
+        <div class="card-sub">New here? Create your account. Your AutoTasks login is separate from AutoTasks.</div>
+      </div>
+      <div class="badge">Extension</div>
+    </div>
+
+    <div id="status" class="status">Loading secure sign in...</div>
+
+    <div class="actions">
+      <button id="signInBtn"    class="primary   hidden">Sign In / Create Account</button>
+      <button id="connectBtn"   class="primary   hidden">Connect extension</button>
+      <button id="signOutBtn"   class="secondary hidden">Sign out</button>
+    </div>
+
+    <div class="foot">After connecting, you can close this tab and use AutoTasks from the side panel in VinSolutions.</div>
+  </main>
+
+</div>
+
+<script>
+  const SERVER = ""; // this page is served by the AutoTasks server itself
+
+  const params = new URLSearchParams(window.location.search);
+  const EXTENSION_ID = params.get("extensionId") || "";
+  const DEVICE_ID    = params.get("deviceId")    || "";
+
+  const statusEl    = document.getElementById("status");
+  const signInBtn   = document.getElementById("signInBtn");
+  const connectBtn  = document.getElementById("connectBtn");
+  const signOutBtn  = document.getElementById("signOutBtn");
+  const subscribeBtn= document.createElement("a"); // AutoTasks has no plans page yet
+
+  let clerk = null;
+  let clerkPublishableKey = "";
+  let connecting = false;          // guards updateUI from clobbering connect-in-progress status
+  let connected  = false;          // latches the success state so nothing repaints over it
+  let extensionReachable = null;   // null = unknown, true/false after ping
+
+  function setStatus(text, type) {
+    statusEl.textContent = text;
+    statusEl.className   = "status" + (type ? " " + type : "");
+  }
+
+  const EXT_TIMEOUT_MSG = "Could not connect to extension. Make sure AutoTasks is installed and enabled, then refresh this page.";
+
+  // ── Channel A: direct extension messaging (needs ?extensionId= in the URL) ──
+  // IMPORTANT: older extension builds don't know the "autopostPing" action, but
+  // they still handle the actual login. ANY response — even "Unknown external
+  // message" — proves the extension is installed and reachable. Only "receiving
+  // end does not exist" means it is genuinely not installed.
+  function directPing(ms) {
+    return new Promise((resolve) => {
+      if (!EXTENSION_ID || !window.chrome || !chrome.runtime || !chrome.runtime.sendMessage) return resolve(false);
+      let settled = false;
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(false); } }, ms);
+      try {
+        chrome.runtime.sendMessage(EXTENSION_ID, { action: "autotasksPing" }, (resp) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          const err = chrome.runtime.lastError;
+          if (err) {
+            console.log("AutoTasks: direct ping error", err.message);
+            // "message port closed" = extension exists but didn't answer → reachable.
+            return resolve(!/receiving end does not exist|could not establish connection/i.test(err.message || ""));
+          }
+          console.log("AutoTasks: direct ping response", resp);
+          // Any response object at all means the extension answered → reachable.
+          resolve(!!resp);
+        });
+      } catch (e) {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(false); }
+      }
+    });
+  }
+
+  // ── Channel B: content-script bridge (works with no extension ID at all) ──
+  function bridgePing(ms) {
+    return new Promise((resolve) => {
+      let settled = false;
+      function onMsg(ev) {
+        if (ev.source !== window || !ev.data || ev.data.__autotasks !== true) return;
+        if (ev.data.type === "AUTOTASKS_PONG" && !settled) {
+          settled = true;
+          window.removeEventListener("message", onMsg);
+          console.log("AutoTasks: bridge ping response v" + (ev.data.version || "?"));
+          resolve(true);
+        }
+      }
+      window.addEventListener("message", onMsg);
+      try { window.postMessage({ __autotasks: true, type: "AUTOTASKS_PING" }, window.location.origin); } catch (e) {}
+      setTimeout(() => {
+        if (!settled) { settled = true; window.removeEventListener("message", onMsg); resolve(false); }
+      }, ms);
+    });
+  }
+
+  // The extension is reachable if EITHER channel answers.
+  async function checkExtensionInstalled() {
+    console.log("AutoTasks: checking extension", EXTENSION_ID || "(via page bridge)");
+    const [direct, bridge] = await Promise.all([directPing(3000), bridgePing(3000)]);
+    extensionReachable = direct || bridge;
+    if (!extensionReachable) console.log("AutoTasks: extension not reachable on any channel");
+    return extensionReachable;
+  }
+
+  function fetchWithTimeout(url, opts, ms) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), ms);
+    return fetch(url, Object.assign({}, opts, { signal: controller.signal }))
+      .finally(() => clearTimeout(t));
+  }
+
+  function show(el) { el.classList.remove("hidden"); }
+  function hide(el) { el.classList.add("hidden"); }
+
+  function getFrontendApiFromPublishableKey(pk) {
+    try {
+      const encoded = String(pk || "").replace(/^pk_(test|live)_/, "");
+      const decoded = atob(encoded);
+      return decoded.replace("$", "").trim();
+    } catch (e) { return ""; }
+  }
+
+  function loadScript(src, publishableKey) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[src="' + src + '"]');
+      if (existing) {
+        setTimeout(() => {
+          if (window.Clerk) resolve();
+          else reject(new Error("Secure sign in loaded, but Clerk is missing."));
+        }, 500);
+        return;
+      }
+      const s = document.createElement("script");
+      s.src = src; s.async = true; s.crossOrigin = "anonymous";
+      s.setAttribute("data-clerk-publishable-key", publishableKey);
+      s.onload = () => {
+        setTimeout(() => {
+          if (window.Clerk) resolve();
+          else reject(new Error("Secure sign in script loaded, but Clerk is missing."));
+        }, 500);
+      };
+      s.onerror = () => reject(new Error("Could not load secure sign in script."));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function getPublicConfig() {
+    const res  = await fetch(SERVER + "/api/tasks/auth/config");
+    const data = await res.json();
+    if (!res.ok || !data.publishableKey) throw new Error("AutoTasks sign in isn't set up yet. Tell your AutoTasks contact.");
+    return { clerkPublishableKey: data.publishableKey };
+  }
+
+  async function initClerk() {
+    const config = await getPublicConfig();
+    clerkPublishableKey = config.clerkPublishableKey;
+
+    const frontendApi = getFrontendApiFromPublishableKey(clerkPublishableKey);
+    if (!frontendApi) throw new Error("Could not read secure login domain.");
+
+    const clerkScriptUrl = "https://" + frontendApi + "/npm/@clerk/clerk-js@5/dist/clerk.browser.js";
+    await loadScript(clerkScriptUrl, clerkPublishableKey);
+
+    if (!window.Clerk) throw new Error("Secure sign in did not initialize.");
+
+    if (typeof window.Clerk === "function") {
+      clerk = new window.Clerk(clerkPublishableKey);
+      await clerk.load();
+    } else {
+      clerk = window.Clerk;
+      await clerk.load({ publishableKey: clerkPublishableKey });
+    }
+
+    if (clerk.addListener) clerk.addListener(() => { updateUI(); });
+    updateUI();
+    // NOTE: we deliberately do NOT ping the extension on page load. The page must
+    // never show an extension error before the user has done anything. Sign-in and
+    // account status are fully independent of whether the extension is connected.
+  }
+
+  function updateUI() {
+    // Never repaint the card while a connect attempt is in flight — the Clerk
+    // session listener fires during getToken() and used to overwrite the
+    // "Connecting..." status while the button sat on "Verifying..." forever.
+    // Likewise, never repaint over the final "connected" success state.
+    if (connecting || connected) return;
+
+    hide(signInBtn); hide(connectBtn); hide(signOutBtn); hide(subscribeBtn);
+
+    if (!clerk) { setStatus("Loading secure sign in...", ""); return; }
+
+    if (!clerk.user) {
+      setStatus("Sign in to your AutoTasks account to continue.", "");
+      show(signInBtn); return;
+    }
+
+    const email =
+      clerk.user.primaryEmailAddress && clerk.user.primaryEmailAddress.emailAddress
+        ? clerk.user.primaryEmailAddress.emailAddress
+        : "AutoTasks user";
+
+    // v4.18: the connect button now works even without ?extensionId= — the
+    // content-script bridge reaches the extension with no ID required.
+    setStatus("Signed in as " + email + ". Ready to connect your extension.", "good");
+    show(connectBtn); show(signOutBtn);
+  }
+
+  async function goToSignIn() {
+    try {
+      if (!clerk) { setStatus("Secure sign in is still loading. Refresh the page.", "bad"); return; }
+      setStatus("Opening secure sign in...", "");
+      const opts = { redirectUrl: window.location.href, afterSignUpUrl: window.location.href, afterSignInUrl: window.location.href };
+      // Prefer sign-up flow — new users who just paid need to create their Clerk account.
+      // Returning users see “Already have an account? Sign in” inside the Clerk modal.
+      if (clerk.redirectToSignUp) { await clerk.redirectToSignUp(opts); return; }
+      if (clerk.openSignUp)       { clerk.openSignUp(opts); return; }
+      if (clerk.redirectToSignIn) { await clerk.redirectToSignIn(opts); return; }
+      if (clerk.openSignIn)       { clerk.openSignIn(opts); return; }
+      throw new Error("Secure sign in is unavailable.");
+    } catch (e) {
+      setStatus("Could not open sign in: " + (e.message || "Refresh and try again."), "bad");
+    }
+  }
+  async function signOut() {
+    if (!clerk) return;
+    await clerk.signOut();
+    updateUI();
+  }
+
+  function resetConnectBtn() {
+    connecting = false;
+    connectBtn.disabled = false;
+    connectBtn.textContent = "Connect extension";
+  }
+
+  async function connectExtension() {
+    // Re-entry guard: ignore double-clicks / a click after success.
+    if (connecting || connected) return;
+    try {
+      connecting = true;
+      connectBtn.disabled = true;
+      connectBtn.textContent = "Verifying...";
+      hide(subscribeBtn);
+      setStatus("Checking your AutoTasks account...", "");
+
+      // Signed in but the Clerk session went stale → recover gracefully instead
+      // of dead-ending. Refresh the page state and ask them to retry.
+      if (!clerk) { resetConnectBtn(); setStatus("Sign-in is still loading. Refresh the page and try again.", "bad"); return; }
+      if (!clerk.user) { resetConnectBtn(); updateUI(); return; }
+      if (!clerk.session) { resetConnectBtn(); setStatus("Your sign-in session expired. Refresh the page, sign in again, then click Connect.", "bad"); return; }
+
+      // 1. Clerk account token (10s cap — Clerk can stall on flaky networks).
+      const accountToken = await Promise.race([
+        clerk.session.getToken(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("Sign-in session timed out. Refresh the page and try again.")), 10000))
+      ]);
+
+      // 2. Mint the extension token. Timeout + one automatic retry so a cold
+      //    server never leaves the button stuck on "Verifying..." forever.
+      let res = null;
+      for (let attempt = 0; attempt < 2 && !res; attempt++) {
+        try {
+          res = await fetchWithTimeout(SERVER + "/api/tasks/auth/create-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + accountToken },
+            body: JSON.stringify({ deviceId: DEVICE_ID })
+          }, 20000);
+        } catch (e) {
+          if (attempt === 0) {
+            console.log("AutoTasks: server slow to respond, retrying create-token...");
+            setStatus("The AutoTasks server is waking up. Retrying automatically...", "");
+          } else {
+            throw new Error("The AutoTasks server took too long to respond. Wait a minute and try again.");
+          }
+        }
+      }
+
+      // Defensive: a dead/booting server can return HTML or an empty body. Never
+      // let res.json() throw us into the generic catch with a confusing message.
+      if (!res) {
+        resetConnectBtn();
+        setStatus("The AutoTasks server didn't respond. Wait a minute and click Connect again.", "bad");
+        return;
+      }
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = null; }
+      if (!data) {
+        resetConnectBtn();
+        setStatus("We couldn't read the server's response. Wait a few seconds and click Connect again.", "bad");
+        return;
+      }
+
+      // 3. INACTIVE ACCOUNT — this is an account/subscription state, NOT an
+      //    extension problem. Show it plainly and offer the plans link.
+      if (!res.ok || !data.success || !data.token) {
+        resetConnectBtn();
+        setStatus(data.error || "We couldn't connect your AutoTasks account. Sign out, sign in again, and click Connect.", "bad");
+        show(subscribeBtn);
+        return;
+      }
+
+      setStatus("Account ready. Connecting AutoTasks...", "good");
+
+      // 4. Hand the token to the extension. We NEVER pre-ping and NEVER block on
+      //    a ping — the installed (published) extension may not answer a ping but
+      //    still handles this login. The published extension SAVES the session the
+      //    moment it receives this message, so the user ends up signed in even if
+      //    the response is slow. Channel A = direct messaging (works on the build
+      //    everyone already has). Channel B = page bridge (no-op on old builds).
+      const payload = { action: "autotasksClerkLogin", token: data.token, expiresInSeconds: data.expiresInSeconds, user: data.user };
+      let done = false;
+
+      function finishConnected(via) {
+        if (done) return; done = true;
+        clearTimeout(softTimer);
+        window.removeEventListener("message", onBridge);
+        connected = true; connecting = false;
+        connectBtn.textContent = "Connected ✓";
+        connectBtn.disabled = true;
+        console.log("AutoTasks: connected via", via);
+        setStatus("AutoTasks is connected. You can close this tab.", "good");
+        setTimeout(() => { try { window.close(); } catch (e) {} }, 1800);
+      }
+
+      // Soft outcome: the token WAS delivered and the extension saves it on
+      // receipt, so the user is almost certainly signed in. Non-fatal, never
+      // logs anyone out, points them at the toolbar icon.
+      function finishSoft() {
+        if (done) return; done = true;
+        window.removeEventListener("message", onBridge);
+        connecting = false;
+        connectBtn.disabled = false;
+        connectBtn.textContent = "Open the AutoTasks side panel";
+        setStatus("Your account is ready and we sent your sign-in to the extension. Click the AutoTasks icon in your Chrome toolbar and you should be signed in. If it still asks you to sign in, make sure AutoTasks is installed and enabled, then click Connect again.", "good");
+      }
+
+      // Only shown when the browser CONFIRMS there is no extension to receive the
+      // message ("receiving end does not exist"). Account stays active.
+      function finishNotInstalled() {
+        if (done) return; done = true;
+        clearTimeout(softTimer);
+        window.removeEventListener("message", onBridge);
+        resetConnectBtn();
+        setStatus("We couldn't find the AutoTasks extension in this browser. Install it (or turn it on in chrome://extensions), then click Connect again. Your account is fine.", "bad");
+      }
+
+      const softTimer = setTimeout(finishSoft, 12000);
+
+      // Channel B result (page bridge, present only on newer extension builds).
+      function onBridge(ev) {
+        if (ev.source !== window || !ev.data || ev.data.__autotasks !== true) return;
+        if (ev.data.type !== "AUTOTASKS_LOGIN_RESULT") return;
+        if (ev.data.success) finishConnected("bridge");
+        // bridge failure is non-fatal — let channel A / the soft timer decide.
+      }
+      window.addEventListener("message", onBridge);
+
+      // Channel A: direct messaging to the installed extension.
+      if (EXTENSION_ID && window.chrome && chrome.runtime && chrome.runtime.sendMessage) {
+        console.log("AutoTasks: sending auth to extension", EXTENSION_ID);
+        try {
+          chrome.runtime.sendMessage(EXTENSION_ID, payload, function(response) {
+            const err = chrome.runtime.lastError;
+            if (err) {
+              console.log("AutoTasks: channel A error", err.message);
+              if (/receiving end does not exist|could not establish connection/i.test(err.message || "")) {
+                finishNotInstalled();
+              }
+              // any other error: leave it to the soft timer (token may be saved).
+              return;
+            }
+            console.log("AutoTasks: channel A response", response);
+            if (response && response.success) finishConnected("direct");
+            else finishSoft(); // success:false → old build already saved the session before replying
+          });
+        } catch (e) {
+          console.log("AutoTasks: channel A threw", e && e.message);
+        }
+      } else {
+        console.log("AutoTasks: no extension ID in URL — relying on page bridge / soft outcome");
+      }
+
+      // Channel B: page bridge. Harmless if no content script is listening.
+      try {
+        window.postMessage({ __autotasks: true, type: "AUTOTASKS_LOGIN", token: data.token, expiresInSeconds: data.expiresInSeconds, user: data.user }, window.location.origin);
+      } catch (e) {}
+    } catch (e) {
+      console.log("AutoTasks: connect error", e && e.message);
+      resetConnectBtn();
+      setStatus(e.message || "Something went wrong. Refresh the page and try again.", "bad");
+    }
+  }
+
+  signInBtn.addEventListener("click",  goToSignIn);
+  connectBtn.addEventListener("click", connectExtension);
+  signOutBtn.addEventListener("click", signOut);
+
+  initClerk().catch((e) => {
+    setStatus(e.message || "Could not load AutoTasks sign in.", "bad");
+    show(signInBtn);
+  });
+</script>
+
+</body>
+</html>
