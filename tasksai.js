@@ -134,6 +134,8 @@ module.exports = function createTasksAi({ apiKey, verifyUser }) {
     let install = '';
     if (sent.startsWith('att1.') && verifyUser) {
       const v = await verifyUser(sent); // signature, expiry AND an active account in Neon
+      // A database hiccup is not a sign-in problem: 503 tells the extension to retry, never to stop the run.
+      if (!v.valid && v.transient) return fail(res, 503, 'overloaded_error', 'AutoTasks is busy for a moment. Trying again.', true);
       if (!v.valid && v.inactive) return fail(res, 403, 'permission_error', `${v.error}.`);
       if (!v.valid) return fail(res, 401, 'authentication_error', `Sign in to AutoTasks again (${v.error.toLowerCase()}).`);
       install = 'u:' + v.session.sub; // caps follow the person, on any computer

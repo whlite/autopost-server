@@ -188,7 +188,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
       if (!(await allowed(v.session))) return { valid: false, inactive: true, error: "No payment yet. AutoTasks unlocks once you've paid" };
     } catch (e) {
       console.error('[tasksauth] status check failed:', e.message);
-      return { valid: false, error: 'Could not check your account. Try again in a minute' };
+      return { valid: false, transient: true, error: 'Could not check your account. Try again in a minute' };
     }
     return v;
   }
@@ -334,6 +334,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   router.post('/api/tasks/auth/verify', express.json({ limit: '16kb' }), async (req, res) => {
     const token = (req.body && req.body.token) || String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
     const v = await check(token);
+    if (!v.valid && v.transient) return res.status(503).json({ valid: false, transient: true, error: v.error });
     if (!v.valid) return res.status(v.inactive ? 402 : 401).json({ valid: false, inactive: !!v.inactive, error: v.error });
     return res.json({ valid: true, user: { email: v.session.email, name: v.session.name || '' }, expiresAt: v.session.exp });
   });
