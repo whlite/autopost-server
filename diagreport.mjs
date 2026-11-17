@@ -13,12 +13,12 @@
 //
 // One copy of this file ships in the extension and one on the server (autopost-server/diagreport.mjs). Keep them identical.
 
+// ---- shared reading helpers
 const frames = (s) => (s?.pages || []).flatMap((p, pi) => (p.frames || []).map((f) => ({ ...f, win: pi, popup: !!p.popup, active: !!p.active })));
 const controls = (s) => frames(s).flatMap((f) => (f.controls || []).map((c) => ({ ...c, _f: f })));
 const walk = (n, fn, depth = 0, path = []) => { if (!n) return; fn(n, depth, path); for (const k of n.k || []) walk(k, fn, depth + 1, [...path, n]); };
 const nodes = (s, test) => { const out = []; for (const f of frames(s)) walk(f.tree, (n, d, p) => { if (test(n, p, f)) out.push({ n, f, p }); }); return out; };
 const evs = (s, kind) => (s?.events || []).filter((e) => e.k === kind);
-const has = (rx, ...vals) => vals.some((v) => v && rx.test(String(v)));
 const RX = {
   text: /\b(text|sms|message|reply|respond|chat)\b/i,
   email: /e-?mail/i,
@@ -32,101 +32,238 @@ const RX = {
   vehicle: /vehicle|make|model|year|vin\b|stock|trade/i,
   lead: /status|source|lead|rep|salesperson|assigned|created|received|contact/i,
 };
+// An id that survived masking: 9s (1.5.1+) or the older "[phone]" mask on a bare number.
+const ID_RX = /9{4,}|\[phone\]/;
+const DATE_RX = /\b9{1,2}\/9{1,2}\/9{2,4}\b|\b9{4}-99-99\b|\b9{1,2}:99\b/;
+const NOISE_RX = /\b(menu|nav|navbar|tab|tablist|breadcrumb|pagination|pager|metric|stat|toolbar|footer|dropdown|option|tooltip|activity-bar)\b|ant-menu|MuiTab/i;
+const PATH_NOISE_RX = /\b(nav|navbar|menu|breadcrumb|pagination|toolbar|dropdown)\b|ant-menu|activity-bar|metric/i;
+const DIR_KEY_RX = /^data-(direction|tags?|channel|kind|medium|(msg|message|activity|note|event|interaction)-?type)$/;
+const idOf = (sel = '') => (String(sel).match(/#([\w-]+)(?!.*#)/) || [])[1] || (String(sel).match(/data-testid="([^"]+)"(?!.*data-testid)/) || [])[1] || '';
+// everything a control is known by: what it says, its name, id, test id and picture
+const words = (c) => `${c.label || ''} ${c.name || ''} ${c.type || ''} ${c.icon || ''} ${idOf(c.sel).replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ')}`;
 const label = (c) => `${c.label || ''} ${c.name || ''} ${c.type || ''}`;
-// Controls that were already on the page before the click (the task row's own buttons) are not the window that opened.
-// A control counts as NEW if recording saw it appear, or it lives in another window or frame.
-const addedSels = (s) => new Set((s?.events || []).filter((e) => e.k === 'dom').flatMap((e) => (e.add || []).map((a) => a.sel)));
-const isNew = (s, c, sels) => sels.has(c.sel) || !c._f.top || c._f.popup;
-const pick = (s, pred) => { const sels = addedSels(s); const all = controls(s).filter(pred); const n = all.find((c) => isNew(s, c, sels)); return n ? { ...n, fresh: true } : all[0] ? { ...all[0], fresh: false } : null; };
-const where = (c) => (c ? `${c.tag}${c.label ? ` "${c.label}"` : ''} ${c.sel}${c.fresh ? ' (appeared after the click)' : ' (was already on the page)'}` : '');
 const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
 const short = (s, n = 90) => (String(s).length > n ? `${String(s).slice(0, n)}…` : String(s));
+const urlKey = (u) => String(u || '').split('?')[0].split('#')[0];
+const frameKey = (f) => `${f.popup ? 'P' : 'M'}|${urlKey(f.url)}|${f.fe || ''}`;
 
-// An element appearing counts as "the text window" if a box to type in appeared, a frame appeared, or a window opened.
-function appeared(s) {
-  const adds = evs(s, 'dom').flatMap((e) => (e.add || []).map((a) => ({ ...a, t: e.t })));
-  const typing = adds.filter((a) => /^(textarea|input)$/.test(a.tag) || a.cls?.includes('editor') || a.type === 'text');
-  const frameAdds = adds.filter((a) => /^i?frame$/.test(a.tag));
-  const tabs = (s?.tabEvents || []).filter((e) => e.k === 'tab-opened');
-  const dialogs = adds.filter((a) => a.role === 'dialog' || /modal|dialog|overlay/i.test(a.cls || ''));
-  return { adds, typing, frameAdds, tabs, dialogs };
+// Which windows and frames are NEW in a step: not seen in any earlier step (a text window left open is not the email
+// window), or seen appearing while recording.
+function stepContext(d) {
+  const seen = new Set();
+  const ctx = {};
+  for (const s of d.steps || []) {
+    const before = new Set(seen);
+    for (const f of frames(s)) seen.add(frameKey(f));
+    const adds = (s.events || []).filter((e) => e.k === 'dom').flatMap((e) => e.add || []);
+    const added = new Set(adds.map((a) => a.sel));
+    const addedFrames = new Set(adds.filter((a) => /^i?frame$/.test(a.tag) && a.id).map((a) => a.id));
+    ctx[s.id] = { before, added, addedFrames, first: !before.size };
+  }
+  return ctx;
+}
+function freshness(c, cx) {
+  if (!cx) return { fresh: false, score: 0 };
+  const newWin = !cx.first && !cx.before.has(frameKey(c._f));
+  const appeared = cx.added.has(c.sel) || (!!c._f.fe && cx.addedFrames.has(c._f.fe));
+  return { fresh: newWin || appeared, newWin, appeared, score: (newWin ? 3 : 0) + (appeared ? 3 : 0) + (newWin && c._f.popup && c._f.top ? 1 : 0) };
+}
+// The best control for a job: new over old, visible over hidden, then the job's own preference.
+function best(s, cx, pred, pref = () => 0) {
+  const scored = controls(s).filter(pred).map((c) => { const fr = freshness(c, cx); return { ...c, ...fr, score: fr.score + (c.on ? 3 : -2) + pref(c) }; });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] || null;
+}
+// "Send" / "Send email" / a send-or-save picture button: yes. "Send <something specific>" (a brochure, a quote): weaker.
+function sendScore(c) {
+  const lab = String(c.label || '').trim(); const id = idOf(c.sel); const pic = `${c.icon || ''}`;
+  let n = -20;
+  if (/^send( (e-?mail|message|now))?$/i.test(lab)) n = 6;
+  else if (/^send\b/i.test(lab)) n = /X/.test(lab) ? -1 : 2; // masked words after "Send": a special-purpose send
+  if (/\bsend\b/i.test(pic)) n = Math.max(n, 6);
+  if (/send/i.test(id)) n = Math.max(n, 0) + 3;
+  else if (/save|submit/i.test(id) && !/draft|template|signature|contact|search/i.test(id)) n = Math.max(n, 0) + 2 + (!lab || c.type === 'image' ? 2 : 0);
+  return n;
+}
+const where = (c) => (c ? `${c.tag}${c.type ? `[${c.type}]` : ''}${c.label ? ` "${c.label}"` : ''}${c.icon ? ` (picture: ${c.icon})` : ''} ${c.sel}${c.fresh ? (c.newWin ? ' (in the window that opened)' : ' (appeared after the click)') : ' (was already on the page)'}${c.on ? '' : ' (hidden)'}` : '');
+
+// Groups of look-alike siblings (task rows, notes): same tag + first class, 2 or more of them.
+function groups(s, onlyFrame) {
+  const out = [];
+  for (const f of frames(s)) {
+    if (onlyFrame && !onlyFrame(f)) continue;
+    walk(f.tree, (n, depth, path) => {
+      const by = new Map();
+      for (const k of n.k || []) {
+        if (!/^(tr|li|div|article|section|span|a)$/.test(k.t)) continue;
+        const key = `${k.t}.${(k.c || '').split(' ')[0]}|${k.a?.role || ''}`;
+        const g = by.get(key) || { items: [], count: 0 };
+        g.items.push(k); g.count += k.n || 1; by.set(key, g);
+      }
+      for (const [key, g] of by) {
+        const prev = !/^\w+\.\|/.test(key) && out.find((o) => o.f === f && o.key === key);
+        if (prev) { prev.items.push(...g.items); prev.count += g.count; } else out.push({ key, items: g.items, count: g.count, f, path: [...path, n] });
+      }
+    });
+  }
+  return out.filter((g) => g.count >= 2);
+}
+const flat = (n) => JSON.stringify(n);
+const sizeOf = (n) => { let k = 0; walk(n, () => { k++; }); return k; };
+const classOf = (n) => `${n.c || ''} ${n.i || ''} ${Object.keys(n.a || {}).join(' ')}`;
+function idAttr(n) {
+  let hit = null;
+  walk(n, (x) => {
+    if (hit) return;
+    const e = Object.entries(x.a || {}).find(([k, v]) => k.startsWith('data-') && ID_RX.test(v) && !/date|time|phone/.test(k));
+    if (e) hit = { tag: x.t, attr: e[0], value: e[1] };
+    else if (x.i && ID_RX.test(x.i) && !hit) hit = { tag: x.t, attr: 'id', value: x.i };
+    else if (x.a?.href && /\{n\}|\{id\}/.test(x.a.href)) hit = { tag: x.t, attr: 'href', value: x.a.href };
+  });
+  return hit;
+}
+
+// The task list: the group of rows that looks most like tasks.
+function taskRows(L) {
+  const cands = groups(L).filter((g) => !g.path.some((p) => /^(nav|header|thead|select)$/.test(p.t) || PATH_NOISE_RX.test(classOf(p))));
+  let top = null;
+  for (const g of cands) {
+    const first = g.items[0];
+    const js = flat(g.items.slice(0, 3));
+    let score = Math.min(g.count, 25) / 5;
+    const size = sizeOf(first);
+    if (size > 250) score -= 8; else if (size > 120) score -= 3;
+    if (!first.c) score -= 2;
+    if (/^tr$/.test(first.t) || first.a?.role === 'row') score += 2;
+    if (/row|task|item|card|lead|record/i.test(first.c || '')) score += 1;
+    if (NOISE_RX.test(classOf(first))) score -= 6;
+    if (idAttr(first)) score += 3;
+    if (/"t":"(button|a)"/.test(js)) score += 2;
+    if (/"x":"(Text|Email|Phone|Call|Text Reply|Send Text|Send Email|E-?mail)"|"aria-label":"[^"]*(text|email|call)/i.test(js)) score += 4;
+    if (/"x":"9{4}\s/.test(js)) score += 1; // a year: a vehicle in the row
+    if (!top || score > top.score) top = { ...g, score };
+  }
+  return top && top.score >= 3 ? top : null;
+}
+// The notes / history list on a customer's page.
+function noteList(C) {
+  let top = null;
+  for (const g of groups(C)) {
+    const first = g.items[0]; const js = flat(g.items.slice(0, 3));
+    let score = Math.min(g.count, 20) / 5;
+    if (/note|history|activity|timeline|comment|event|log|message|conversation|interaction/i.test(classOf(first))) score += 3;
+    const dirAttr = g.items.some((n) => Object.keys(n.a || {}).some((k) => DIR_KEY_RX.test(k)));
+    const named = /note|history|activity|timeline|comment|event|log|message|conversation|interaction/i.test(classOf(first));
+    if (dirAttr) score += 3;
+    if (DATE_RX.test(js)) score += 3; else score -= 4;
+    if (!named && !dirAttr) score -= 4;
+    if (NOISE_RX.test(classOf(first)) || g.path.some((p) => PATH_NOISE_RX.test(classOf(p)))) score -= 6;
+    if (!top || score > top.score) top = { ...g, score };
+  }
+  return top && top.score >= 5 ? top : null;
+}
+
+// The rich-text email body: a frame that is all editor (designMode), a contenteditable, or a frame the composer holds
+// whose name says editor/content/body.
+function emailBody(E, cx) {
+  const fs = frames(E);
+  const designed = fs.find((f) => f.editable && !f.top);
+  if (designed) return { kind: 'rich-text editor in a frame (whole frame is the editor)', where: `frame ${designed.frameId} inside ${urlKey(designed.url)}` };
+  const ce = nodes(E, (n) => n.a?.contenteditable === 'true' || n.a?.contenteditable === '')[0];
+  if (ce) return { kind: `contenteditable <${ce.n.t}>${ce.f.top ? '' : ' inside a frame'}`, where: ce.n.i ? `#${ce.n.i}` : ce.n.c ? `.${ce.n.c.split(' ')[0]}` : ce.n.t };
+  for (const f of fs) {
+    const ed = (f.frames || []).find((x) => /editor|content|body|compose|mce|cke|rich|rad/i.test(`${x.id || ''} ${x.name || ''}`));
+    if (ed && freshness({ _f: f, sel: '' }, cx).newWin !== false) {
+      const child = fs.find((x) => !x.top && x.win === f.win && urlKey(x.url) === urlKey(f.url) && x.nodes <= 60);
+      if (child || ed.on !== false) return { kind: 'rich-text editor in a frame', where: `iframe #${ed.id || ed.name}` };
+    }
+  }
+  const ta = best(E, cx, (c) => c.tag === 'textarea' || c.type === 'textbox', (c) => (RX.body.test(words(c)) ? 2 : 0));
+  if (ta && ta.fresh && ta.on) return { kind: 'plain text box', where: where(ta) };
+  return null;
 }
 
 export function analyze(d) {
   const S = Object.fromEntries((d.steps || []).map((s) => [s.id, s]));
+  const CX = stepContext(d);
   const checks = [];
   const add = (group, id, name, ok, evidence, fix) => checks.push({ group, id, name, ok: !!ok, evidence: ok ? evidence : '', fix: ok ? '' : fix });
 
   // ---- LIST
   const L = S.tasks;
-  const rows = L ? nodes(L, (n, p, f) => f.top && /^(tr|li|div)$/.test(n.t) && n.n >= 2 && JSON.stringify(n.k || []).includes('"t":"button"') || (n.n >= 2 && /^(tr|li)$/.test(n.t))) : [];
-  const row = rows[0]?.n;
-  add('LIST', 'list.page', 'Task list found', L && rows.length, row ? `repeating row <${row.t}${row.c ? '.' + row.c.split(' ')[0] : ''}> x${row.n}` : '', 'Redo "Your task list" with tasks showing on screen.');
-  const rowAttr = row && Object.entries(row.a || {}).find(([k, v]) => k.startsWith('data-') && /9{3,}/.test(v));
-  const rowId = row && (rowAttr || (row.i && /9{3,}/.test(row.i)));
-  add('LIST', 'list.rowid', 'Each row carries the customer id', rowId, rowAttr ? `${rowAttr[0]}="${rowAttr[1]}"` : '', 'Rows had no id we could see. Add a note saying where the customer\'s id shows (address or attribute) after they open one.');
-  const anchor = row && JSON.stringify(row).includes('"t":"a"');
+  const rows = L && taskRows(L);
+  const row = rows?.items[0];
+  add('LIST', 'list.page', 'Task list found', rows, rows ? `rows <${row.t}${row.c ? '.' + row.c.split(' ')[0] : ''}> x${rows.count}` : '', 'We couldn\'t find a list of tasks. Redo "Your task list" with several tasks showing on screen.');
+  const rid = rows && rows.items.map(idAttr).find(Boolean);
+  add('LIST', 'list.rowid', 'Each row carries an id (customer or task)', rid, rid ? `${rid.tag} ${rid.attr}="${rid.value}"` : '', 'Rows had no id we could see. Add a note saying where the customer\'s id shows (address or attribute) after they open one.');
+  const anchor = rows && /"t":"a"|customer-?name|contact-?name/i.test(flat(rows.items));
   add('LIST', 'list.name', 'Customer name link in the row', anchor, 'link inside the row', 'No link to the customer inside a task row. Note how a customer is opened from the list.');
-  const taskBtns = L ? controls(L).filter((c) => c.tag === 'button' || c.tag === 'a' || c.type === 'button') : [];
-  const kinds = new Set(taskBtns.map((c) => (RX.email.test(label(c)) ? 'email' : RX.text.test(label(c)) ? 'text' : RX.call.test(label(c)) ? 'call' : '')).filter(Boolean));
-  add('LIST', 'list.types', 'Text / Email / Call buttons tell themselves apart', kinds.has('text') && kinds.has('email'), `found: ${[...kinds].join(', ')}`, `Only found: ${[...kinds].join(', ') || 'none'}. We need to see a row with a Text task AND a row with an Email task (and a Call task if you have them).`);
-  add('LIST', 'list.refresh', 'Refresh control', L && controls(L).some((c) => RX.refresh.test(label(c))) || evs(S.done, 'click').some((c) => RX.refresh.test(`${c.label} ${c.cls}`)), 'refresh button', 'No Refresh button seen. Redo "Finish a task and refresh" and press the CRM\'s refresh.');
-  const veh = L && nodes(L, (n) => n.x && /^9{4}\s/.test(n.x)).length > 0;
-  add('LIST', 'list.vehicle', 'Vehicle shown in the row', veh, 'a year + vehicle text in the row', 'Could not see a vehicle in the task rows (fine if the CRM does not show one there).');
+  const rowJs = rows ? flat(rows.items) : '';
+  const taskBtns = L ? controls(L).filter((c) => c.tag === 'button' || c.tag === 'a' || c.type === 'button' || c.type === 'image') : [];
+  const kinds = new Set(taskBtns.map((c) => (RX.email.test(words(c)) ? 'email' : RX.text.test(words(c)) ? 'text' : RX.call.test(words(c)) ? 'call' : '')).filter(Boolean));
+  for (const [k, rx] of [['email', /"x":"[^"]*e-?mail/i], ['text', /"x":"[^"]*\b(text|sms)\b/i], ['call', /"x":"[^"]*\b(call|phone)\b/i]]) if (rx.test(rowJs)) kinds.add(k);
+  add('LIST', 'list.types', 'Text / Email / Call tasks tell themselves apart', kinds.has('text') && kinds.has('email'), `found: ${[...kinds].join(', ')}`, `Only found: ${[...kinds].join(', ') || 'none'}. We need to see a row with a Text task AND a row with an Email task (and a Call task if you have them).`);
+  add('LIST', 'list.refresh', 'Refresh control', L && controls(L).some((c) => RX.refresh.test(words(c))) || evs(S.done, 'click').some((c) => RX.refresh.test(`${c.label} ${c.cls} ${c.id}`)), 'refresh button', 'No Refresh button seen. Redo "Finish a task and refresh" and press the CRM\'s refresh.');
+  add('LIST', 'list.vehicle', 'Vehicle shown in the row', rows && /"x":"9{4}\s/.test(rowJs), 'a year + vehicle text in the row', 'Could not see a vehicle in the task rows (fine if the CRM does not show one there).');
 
   // ---- TEXT
-  const T = S.text;
-  const tAp = T && appeared(T);
-  add('TEXT', 'text.click', 'The click on the Text task was recorded', T && evs(T, 'click').length, T ? `${evs(T, 'click').length} click(s), last on ${short(evs(T, 'click').slice(-1)[0]?.sel || '')}` : '', 'Redo "Open a text task": press Start BEFORE clicking the Text button.');
-  const kindT = tAp && (tAp.tabs.length ? 'a new browser window/tab' : tAp.frameAdds.length ? 'a frame inside the page' : tAp.dialogs.length ? 'a dialog on the page' : tAp.typing.length ? 'a box inline on the page' : '');
-  add('TEXT', 'text.window', 'We know how the text window opens', kindT, kindT || '', 'Nothing seemed to open. Press Done only after the text box is on screen.');
-  const tBox = T && pick(T, (c) => (c.tag === 'textarea' || c.type === 'textbox' || /^(text|)$/.test(c.type || '') && c.tag === 'input') && (RX.body.test(label(c)) || c.tag === 'textarea'));
-  add('TEXT', 'text.box', 'Message box found', tBox, where(tBox), 'The text box was not in the capture. Make sure the text window is open and empty when you press Done.');
-  const sendOnly = (c) => /^\s*send\b/i.test(c.label || '') && !/(text|email|sms)\b/i.test(c.label || '');
-  const tSend = T && (pick(T, sendOnly) || pick(T, (c) => RX.send.test(label(c)) && !RX.email.test(label(c))));
-  add('TEXT', 'text.send', 'Send button found', tSend && tSend.fresh, where(tSend) + (tSend?.off ? ' (disabled while empty)' : ''), tSend ? 'The only Send we saw was already on the page before the text window opened (it may be the task row\'s own button). Redo with the text window open when you press Done.' : 'No Send button seen in the text window.');
-  const first = evs(T, 'click')[0]; const ready = tAp && [...tAp.typing, ...tAp.frameAdds].map((a) => a.t).filter((t) => first && t >= first.t).sort((a, b) => a - b)[0];
-  add('TEXT', 'text.timing', 'How long the text window takes to be ready', ready != null && first, ready != null && first ? secs(ready - first.t) : '', 'Could not time it (the window may be in another site we could not read).');
-  add('TEXT', 'text.shot', 'Screenshot of the text window', T?.shots?.length, `${T?.shots?.length || 0} screenshot(s)`, 'No screenshot (the tester turned them off or the window could not be photographed).');
+  const T = S.text; const tx = CX.text;
+  const tClicks = evs(T, 'click');
+  add('TEXT', 'text.click', 'The click on the Text task was recorded', T && tClicks.length, T ? `${tClicks.length} click(s)` : '', 'We didn\'t see you click a Text button. Redo this step and click a task\'s Text button while it\'s running.');
+  const tBox = T && best(T, tx, (c) => c.tag === 'textarea' || c.type === 'textbox' || /contenteditable/.test(`${c.type}`) || (c.tag === 'input' && /^(text|)$/.test(c.type || '') && RX.body.test(words(c))), (c) => (c.tag === 'textarea' ? 2 : 0) + (RX.body.test(words(c)) ? 1 : 0) - (/search/i.test(words(c)) ? 6 : 0));
+  const tOpen = tBox?.on && (tBox.fresh || tBox._f.popup) ? (tBox._f.popup ? 'a new browser window/tab' : tBox.newWin ? 'a frame inside the page' : 'on the page (appeared after the click)') : '';
+  add('TEXT', 'text.window', 'We know how the text window opens', tOpen, tOpen, 'Nothing new seemed to open. Press Ready only after the text box is on screen.');
+  add('TEXT', 'text.box', 'Message box found', tBox && (tBox.fresh || tBox._f.popup) && tBox.on, where(tBox), 'The text box was not in the capture. Make sure the text window is open and empty when you press Ready.');
+  const tSend = T && best(T, tx, (c) => /^(button|a|input)$/.test(c.tag) || /button/.test(c.type || ''), (c) => (/^\s*send\b/i.test(c.label || '') ? 5 : /\bsend\b/i.test(words(c)) ? 3 : -20) - (RX.email.test(words(c)) ? 4 : 0) + (tBox && c._f.frameId === tBox._f.frameId && c._f.win === tBox._f.win ? 2 : 0));
+  add('TEXT', 'text.send', 'Send button found', tSend && tSend.score > 0 && (tSend.fresh || tSend._f.popup) && tSend.on, where(tSend) + (tSend?.off ? ' (disabled while empty)' : ''), 'No Send button in the text window. Redo with the text window open when you press Ready.');
+  const tFirst = tClicks[0];
+  const tReady = T && tFirst && [...evs(T, 'dom').filter((e) => (e.add || []).some((a) => /^(textarea|input|i?frame)$/.test(a.tag))).map((e) => e.t), ...(T.tabEvents || []).filter((e) => e.k === 'tab-loaded').map((e) => e.t)].filter((t) => t >= tFirst.t).sort((a, b) => a - b)[0];
+  add('TEXT', 'text.timing', 'How long the text window takes to be ready', tReady != null, tReady != null ? secs(tReady - tFirst.t) : '', 'Could not time it.');
+  add('TEXT', 'text.shot', 'Screenshot of the text window', T?.shots?.length, `${T?.shots?.length || 0} screenshot(s)`, `No screenshot${T?.shotErrors ? ` (${T.shotErrors[0]})` : ' (pictures were off)'}.`);
 
   // ---- EMAIL
-  const E = S.email;
-  const eAp = E && appeared(E);
-  add('EMAIL', 'email.click', 'The click on the Email task was recorded', E && evs(E, 'click').length, E ? `${evs(E, 'click').length} click(s)` : '', 'Redo "Open an email task": press Start BEFORE clicking the Email button.');
-  const kindE = eAp && (eAp.tabs.length ? 'a new browser window/tab' : eAp.frameAdds.length ? 'a frame inside the page' : eAp.dialogs.length ? 'a dialog on the page' : eAp.typing.length ? 'inline on the page' : '');
-  add('EMAIL', 'email.window', 'We know how the email composer opens', kindE, kindE || '', 'Nothing seemed to open. Press Done only after the email composer is on screen.');
-  const eSub = E && pick(E, (c) => RX.subject.test(label(c)));
-  add('EMAIL', 'email.subject', 'Subject field', eSub, where(eSub), 'No Subject field seen.');
-  const eEditFrame = E && frames(E).find((f) => /^about:|blank|editor|compose|rich|mce|ck/i.test(`${f.url} ${f.title}`) && f.nodes <= 40) || null;
-  const eBodyNode = E && nodes(E, (n, p, f) => n.a?.contenteditable === 'true' && (!f.top || f.popup))[0];
-  const eBody = E && (pick(E, (c) => c.tag === 'textarea' || /contenteditable/.test(`${c.type}`) || c.type === 'textbox') || null);
-  add('EMAIL', 'email.body', 'Body editor found (and what kind it is)', (eBody && eBody.fresh) || eBodyNode || eEditFrame, eBodyNode ? `contenteditable <${eBodyNode.n.t}${eBodyNode.n.c ? '.' + eBodyNode.n.c.split(' ')[0] : ''}> inside ${eBodyNode.f.top ? 'the page' : 'a frame (rich-text editor)'}` : eBody ? where(eBody) : eEditFrame ? 'rich-text editor frame' : '', 'The email body editor was not in the capture. Redo with the composer fully loaded (wait for the editor to appear).');
-  const eTpl = E && controls(E).find((c) => c.tag === 'select' && /template|signature/i.test(`${label(c)} ${c.sel}`));
-  add('EMAIL', 'email.template', 'Template / signature picker (if the CRM has one)', true, eTpl ? eTpl.sel : 'none seen (ok if the CRM has no templates)', '');
-  const eSend = E && (pick(E, sendOnly) || pick(E, (c) => /^\s*send\s+e-?mail/i.test(c.label || '') || (c.type === 'submit' && c.tag === 'button')));
-  add('EMAIL', 'email.send', 'Send button', eSend && eSend.fresh, where(eSend), eSend ? 'The only Send we saw was already on the page before the composer opened. Redo with the composer open when you press Done.' : 'No Send button seen in the email window.');
-  const eCancel = E && pick(E, (c) => RX.cancel.test(label(c)));
-  add('EMAIL', 'email.cancel', 'Cancel / close button', eCancel, where(eCancel), 'No Cancel or Close button seen (needed to close a window we opened).');
-  add('EMAIL', 'email.shot', 'Screenshot of the email window', E?.shots?.length, `${E?.shots?.length || 0} screenshot(s)`, 'No screenshot of the email window.');
+  const E = S.email; const ex = CX.email;
+  add('EMAIL', 'email.click', 'The click on the Email task was recorded', E && evs(E, 'click').length, E ? `${evs(E, 'click').length} click(s)` : '', 'We didn\'t see you click an Email button. Redo this step and click a task\'s Email button while it\'s running.');
+  const eSub = E && best(E, ex, (c) => RX.subject.test(words(c)) && /^(input|textarea)$/.test(c.tag));
+  const eSubOk = eSub && (eSub.fresh || eSub._f.popup) && eSub.on;
+  const eOpen = eSubOk ? (eSub._f.popup ? 'a new browser window/tab' : eSub.newWin ? 'a frame inside the page' : 'on the page (appeared after the click)') : '';
+  add('EMAIL', 'email.window', 'We know how the email composer opens', eOpen, eOpen, 'We couldn\'t find a new email window. Close the text window first, then open the email and press Ready once it\'s on screen.');
+  add('EMAIL', 'email.subject', 'Subject field', eSubOk, where(eSub), 'No Subject field seen in a new window.');
+  const near = (c) => (eSub && c._f.win === eSub._f.win ? 3 : 0) + (eSub && c._f.frameId === eSub._f.frameId ? 1 : 0);
+  const eBody = E && emailBody(E, ex);
+  add('EMAIL', 'email.body', 'Body editor found (and what kind it is)', eBody, eBody ? `${eBody.kind}: ${eBody.where}` : '', 'The email body editor was not in the capture. Redo with the composer fully loaded (wait for the editor to appear).');
+  const eTpl = E && best(E, ex, (c) => c.tag === 'select' && /template|signature|content/i.test(words(c)), near);
+  add('EMAIL', 'email.template', 'Template / signature picker (if the CRM has one)', true, eTpl ? where(eTpl) : 'none seen (ok if the CRM has no templates)', '');
+  const eSend = E && best(E, ex, (c) => /^(button|a|input)$/.test(c.tag) || /button/.test(c.type || ''),
+    (c) => sendScore(c) + near(c) - (/\b(text|sms)\b/i.test(words(c)) ? 6 : 0));
+  const eSends = E && eSend ? controls(E).filter((c) => sendScore(c) > 0 && c.on && c._f.win === eSend._f.win && c.sel !== eSend.sel).slice(0, 4) : [];
+  add('EMAIL', 'email.send', 'Send button', eSend && eSend.score > 0 && (eSend.fresh || eSend._f.popup) && eSend.on, where(eSend) + (eSends.length ? `  | other send-like buttons there: ${eSends.map((c) => `${c.label || c.icon || ''} #${idOf(c.sel)}`.trim()).join(', ')}` : ''), 'No Send button in the new email window. Redo with the composer open when you press Ready.');
+  const eCancel = E && best(E, ex, (c) => /^(button|a|input)$/.test(c.tag) || /button/.test(c.type || ''), (c) => (RX.cancel.test(words(c)) ? 4 : -20) + near(c) - (/attach|upload|progress/i.test(words(c)) ? 3 : 0));
+  add('EMAIL', 'email.cancel', 'Cancel / close button', eCancel && eCancel.score > 0, where(eCancel), 'No Cancel or Close button seen (needed to close a window we opened).');
+  add('EMAIL', 'email.shot', 'Screenshot of the email window', E?.shots?.length, `${E?.shots?.length || 0} screenshot(s)`, `No screenshot${E?.shotErrors ? ` (${E.shotErrors[0]})` : ' (pictures were off)'}.`);
 
   // ---- CUSTOMER
   const C = S.customer;
-  const notes = C && nodes(C, (n) => n.n >= 2 && /^(div|li|tr|article|section)$/.test(n.t) && (n.c || n.a));
-  const noteKind = notes?.find((x) => Object.keys(x.n.a || {}).some((k) => /direction|tag|kind|type/.test(k)));
+  const notes = C && noteList(C);
   add('CUSTOMER', 'cust.page', 'Customer page captured', C && frames(C).length, C ? `${frames(C).length} frame(s)` : '', 'Redo "A customer\'s page".');
-  add('CUSTOMER', 'cust.notes', 'Notes / history items found', notes?.length, notes?.length ? `repeating item <${notes[0].n.t}${notes[0].n.c ? '.' + notes[0].n.c.split(' ')[0] : ''}> x${notes[0].n.n}` : '', 'No repeating notes/history list seen. Scroll the customer\'s history into view before pressing Done.');
-  add('CUSTOMER', 'cust.direction', 'Each note says inbound/outbound, type and date', noteKind || (notes?.length && notes[0].n.k?.length >= 2), noteKind ? Object.entries(noteKind.n.a).slice(0, 3).map(([k, v]) => `${k}=${v}`).join(' ') : 'structure has separate date/text pieces', 'We could not tell inbound from outbound. Include a customer who has both a received and a sent message.');
+  const nf = notes?.items[0];
+  add('CUSTOMER', 'cust.notes', 'Notes / history items found', notes, notes ? `<${nf.t}${nf.c ? '.' + nf.c.split(' ')[0] : ''}> x${notes.count}` : '', 'No notes/history list seen. Scroll the customer\'s history into view before pressing Ready.');
+  const dir = notes && notes.items.map((n) => Object.entries(n.a || {}).filter(([k]) => DIR_KEY_RX.test(k))).find((e) => e.length);
+  const dirText = notes && /inbound|outbound|incoming|outgoing|received|sent|\bfrom\b|\bto\b/i.test(flat(notes.items));
+  add('CUSTOMER', 'cust.direction', 'Each note says inbound/outbound, type and date', notes && (dir || dirText) && DATE_RX.test(flat(notes.items)), dir ? dir.map(([k, v]) => `${k}=${v}`).join(' ') + ' + dates' : 'words like sent/received + dates', 'We could not tell received from sent messages. Pick a customer who has texted or emailed you back.');
+  const nameEl = C && nodes(C, (n) => /customer-?name|contact-?name|cust-?name|CustomerName/i.test(`${n.i || ''} ${n.c || ''} ${n.a?.['data-testid'] || ''}`))[0];
+  add('CUSTOMER', 'cust.name', 'Where the customer\'s name is', nameEl, nameEl ? `${nameEl.n.t}${nameEl.n.i ? '#' + nameEl.n.i : ''}${nameEl.n.c ? '.' + nameEl.n.c.split(' ')[0] : ''}${nameEl.n.a?.['data-testid'] ? `[data-testid="${nameEl.n.a['data-testid']}"]` : ''}` : '', 'We couldn\'t spot the customer\'s name on their page (we use it to greet them). Add a note saying where it shows.');
   const phone = C && (controls(C).some((c) => /tel:/.test(c.type || '') || RX.phone.test(label(c))) || nodes(C, (n) => n.a?.href?.startsWith('tel:')).length || nodes(C, (n) => RX.phone.test(n.x || '')).length);
   add('CUSTOMER', 'cust.phone', 'Phone numbers (tel: links or labelled fields)', phone, 'found', 'No phone field or tel: link seen on the customer page.');
-  const labs = C && nodes(C, (n) => /^(label|th|dt|span|div)$/.test(n.t) && n.x && (RX.vehicle.test(n.x) || RX.lead.test(n.x))).map((x) => x.n.x);
+  const labs = C && nodes(C, (n) => /^(label|th|dt|span|div|td|b|strong)$/.test(n.t) && n.x && n.x.length < 40 && (RX.vehicle.test(n.x) || RX.lead.test(n.x))).map((x) => x.n.x);
   add('CUSTOMER', 'cust.fields', 'Lead / vehicle / trade / status labels', labs?.length >= 3, labs ? short([...new Set(labs)].slice(0, 8).join(', '), 120) : '', 'Fewer than 3 lead or vehicle labels seen. Open a customer with an active lead.');
   const lazy = C && (evs(C, 'net').length || evs(C, 'dom').length > 1);
-  add('CUSTOMER', 'cust.lazy', 'Lazy loading observed (does anything load as you scroll?)', lazy, `${evs(C, 'net').length} network call(s), ${evs(C, 'dom').length} page change(s)`, 'No loading activity seen. Scroll to the notes while recording.');
+  add('CUSTOMER', 'cust.lazy', 'Loading observed (what loads as you scroll)', lazy, `${evs(C, 'net').length} network call(s), ${evs(C, 'dom').length} page change(s)`, 'No loading activity seen. Scroll to the notes while recording.');
   add('CUSTOMER', 'cust.opt', 'Opted-out / blocked customer captured', S.blocked, S.blocked ? 'step done' : '', 'Optional but important: capture one customer who cannot be texted or emailed so we can find how the CRM shows it.');
 
   // ---- SEND
   const X = S.send;
-  const sendClick = X && evs(X, 'click').find((c) => RX.send.test(`${c.label} ${c.cls} ${c.id}`));
+  const sendClick = X && evs(X, 'click').find((c) => RX.send.test(`${c.label} ${c.cls} ${c.id}`) || /save|submit/i.test(`${c.id}`));
   add('SEND', 'send.click', 'A real test send was recorded', sendClick, sendClick ? `click ${short(sendClick.sel)} at ${secs(sendClick.t)}` : '', 'Optional but the best way to prove sending: send a text or email to your OWN number/address with the recording on.');
   const sendNet = X && evs(X, 'net').filter((e) => e.m === 'POST' && e.t >= (sendClick?.t || 0));
   const closed = X && ((X.tabEvents || []).some((e) => e.k === 'tab-closed') || evs(X, 'unload').length);
@@ -138,10 +275,10 @@ export function analyze(d) {
   add('DONE', 'done.step', 'Completing a task + refresh', Dn && evs(Dn, 'click').length, Dn ? `${evs(Dn, 'click').length} click(s), ${evs(Dn, 'net').length} network call(s)` : '', 'Optional: shows how a finished task leaves the list.');
 
   // ---- overall
-  add('ALL', 'all.shots', 'Screenshots for the required steps', ['tasks', 'text', 'email', 'customer'].every((k) => S[k]?.shots?.length), 'all four', 'Some required steps have no screenshot.');
+  add('ALL', 'all.shots', 'Screenshots for the required steps', ['tasks', 'text', 'email', 'customer'].every((k) => S[k]?.shots?.length), 'all four', `Some required steps have no screenshot${d.pictures && d.pictures !== 'yes' ? ` (${d.pictures})` : ''}.`);
   add('ALL', 'all.frames', 'Every window and frame was readable', !(d.steps || []).some((s) => s.permissionAsk && !s.permissionAsk.granted), 'yes', 'The tester did not allow a second site the CRM uses (its pop-ups live there). Ask them to redo the step and choose Allow.');
 
-  const required = checks.filter((c) => !/^(cust\.opt|send\.|done\.|list\.vehicle|list\.refresh|text\.shot|email\.shot|all\.shots|text\.timing|email\.template)/.test(c.id));
+  const required = checks.filter((c) => !/^(cust\.opt|send\.|done\.|list\.vehicle|list\.refresh|text\.shot|email\.shot|all\.shots|text\.timing|email\.template|cust\.lazy)/.test(c.id));
   const missing = required.filter((c) => !c.ok);
   return { checks, missing, passed: checks.filter((c) => c.ok).length, total: checks.length, ready: !missing.length, requiredTotal: required.length };
 }
