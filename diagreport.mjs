@@ -290,6 +290,7 @@ export function buildReport(d) {
   P(`AUTOTASKS DIAGNOSTIC: ${d.crm || '(CRM not named)'}  ·  ${d.host || ''}`);
   P(`AutoTasks ${d.version} · ${d.browser || ''} · screen ${d.screen || ''} · ${d.at}`);
   if (d.email) P(`Tester: ${d.email}`);
+  if (d.picsAsk) P(`Pictures: Chrome said ${d.picsAsk}${d.pictures ? ` · result: ${d.pictures}` : ''}`);
   if (d.note) P(`Tester's note: ${d.note}`);
   P('');
   P(`READINESS: ${a.ready ? 'READY TO CODE' : `NOT YET (${a.missing.length} gap${a.missing.length === 1 ? '' : 's'})`}  ·  ${a.passed}/${a.total} checks pass`);
