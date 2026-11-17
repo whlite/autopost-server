@@ -11,7 +11,13 @@
 //   the page before sending. This file never logs a capture's contents, only who sent it and how big it was.
 //
 // ROUTES
-//   POST /api/tasks/capture                 the extension sends one capture (Bearer AutoTasks token, or install id)
+//   POST /api/tasks/diagnostic              the extension's "Run diagnostic": all steps, events and screenshots at once
+//   GET  /api/tasks/diagnostics?secret=                 list, with readiness (can we code this CRM from it?)
+//   GET  /api/tasks/diagnostics/:id/report?secret=      the paste-able text report + the readiness checklist
+//   GET  /api/tasks/diagnostics/:id/view?secret=        the same report with the screenshots, in a browser
+//   GET  /api/tasks/diagnostics/:id/bundle?secret=      the full JSON (screenshots included), for replay tools
+//   GET  /api/tasks/diagnostics/:id/shot/:n.jpg?secret= one screenshot
+//   POST /api/tasks/capture                 (older) the extension sends one capture (Bearer AutoTasks token, or install id)
 //   GET  /api/tasks/captures?secret=        list (newest first; ?crm= and ?email= filter)      ADMIN_SECRET
 //   GET  /api/tasks/captures/:id?secret=    one capture as a .json download                    ADMIN_SECRET
 //   POST /api/tasks/captures/:id/done?secret=   mark it handled                                ADMIN_SECRET
@@ -58,7 +64,25 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
     return schemaReady;
   }
 
-  router.use('/api/tasks/capture', (req, res, next) => {
+  let diagReady = null;
+  function initDiag() {
+    if (!pool) return Promise.reject(new Error('no database'));
+    diagReady ||= pool.query(`
+      CREATE TABLE IF NOT EXISTS autotasks_diagnostics (
+        id SERIAL PRIMARY KEY,
+        email TEXT, install TEXT, crm TEXT, host TEXT, note TEXT, ext_version TEXT,
+        steps INTEGER, bytes INTEGER, ready BOOLEAN, gaps INTEGER,
+        payload JSONB NOT NULL,
+        shots JSONB,
+        handled_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );`).catch((e) => { diagReady = null; throw e; });
+    return diagReady;
+  }
+  let reportLib = null;
+  const lib = async () => (reportLib ||= await import('./diagreport.mjs'));
+
+  router.use(['/api/tasks/capture', '/api/tasks/diagnostic'], (req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -120,6 +144,56 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
     }
   });
 
+  router.post('/api/tasks/diagnostic', express.json({ limit: '25mb' }), async (req, res) => {
+    const b = req.body || {};
+    if (b.app !== 'autotasks' || b.kind !== 'diagnostic' || !Array.isArray(b.steps) || !b.steps.length) {
+      return res.status(400).json({ success: false, error: 'That is not an AutoTasks diagnostic.' });
+    }
+    const token = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    let email = '';
+    if (token) {
+      const v = verifyToken ? verifyToken(token) : { valid: false };
+      if (!v.valid) return res.status(401).json({ success: false, error: 'Your sign-in expired. Sign in again, then press Submit.' });
+      email = String(v.session.email || '').toLowerCase();
+    } else if (!INSTALL_RE.test(String(b.install || ''))) {
+      return res.status(401).json({ success: false, error: 'Sign in to AutoTasks first, then press Submit.' });
+    }
+    if (tooMany('diag:' + (email || b.install))) return res.status(429).json({ success: false, error: 'That is a lot of diagnostics. Try again in an hour.' });
+    try {
+      await initDiag();
+      // screenshots live in their own column so lists stay light
+      const shots = [];
+      const steps = b.steps.slice(0, 12).map((s, si) => ({
+        ...s,
+        shots: (s.shots || []).slice(0, 4).map((x) => {
+          const jpg = String(x.jpg || '');
+          if (jpg.length > 4e6) return { window: x.window, w: x.w, h: x.h, url: x.url, dropped: true };
+          shots.push({ step: s.id, label: s.label, window: x.window, w: x.w, h: x.h, url: x.url, jpg });
+          return { window: x.window, w: x.w, h: x.h, url: x.url, n: shots.length - 1 };
+        }),
+      }));
+      const payload = { ...b, email: undefined, steps };
+      const bytes = Buffer.byteLength(JSON.stringify(payload)) + shots.reduce((n, x) => n + x.jpg.length, 0);
+      const a = (await lib()).analyze(payload);
+      const r = await pool.query(
+        `INSERT INTO autotasks_diagnostics (email, install, crm, host, note, ext_version, steps, bytes, ready, gaps, payload, shots)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+        [email || null, clean(b.install, 40) || null, clean(b.crm, 80), clean(b.host, 200).toLowerCase(), clean(b.note, 2000), clean(b.version, 20),
+          steps.length, bytes, a.ready, a.missing.length, JSON.stringify(payload), JSON.stringify(shots)]);
+      const id = r.rows[0].id;
+      console.log(`[taskscapture] DIAGNOSTIC #${id} "${clean(b.crm, 80)}" (${clean(b.host, 80)}) from ${email || 'install'}: ${steps.length} steps, ${shots.length} shots, ${Math.round(bytes / 1024)} KB, ${a.ready ? 'READY' : a.missing.length + ' gaps'}`);
+      if (notify && notify.captureLead) {
+        notify.captureLead({ email: email || undefined, source: 'autotasks',
+          notes: `CRM DIAGNOSTIC #${id}: ${clean(b.crm, 60) || clean(b.host, 60)}, ${steps.length} steps, ${a.ready ? 'READY TO CODE' : a.missing.length + ' gaps'}. /api/tasks/diagnostics/${id}/view` })
+          .catch((e) => console.error('[taskscapture] alert failed:', e.message));
+      }
+      return res.json({ success: true, id, ready: a.ready });
+    } catch (e) {
+      console.error('[taskscapture] diagnostic save failed:', e.message);
+      return res.status(503).json({ success: false, error: "AutoTasks couldn't save it right now. Use Save file and email it to us." });
+    }
+  });
+
   // ---- owner only
   function admin(req, res, next) {
     const given = req.query.secret || req.get('x-admin-secret') || '';
@@ -150,6 +224,54 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
         captures: r.rows,
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  async function diagRow(id, withShots) {
+    await initDiag();
+    const r = await pool.query(`SELECT id, created_at, email, crm, host, payload${withShots ? ', shots' : ''} FROM autotasks_diagnostics WHERE id = $1`, [Number(id) || 0]);
+    return r.rows[0] || null;
+  }
+  router.get('/api/tasks/diagnostics', admin, async (req, res) => {
+    try {
+      await initDiag();
+      const r = await pool.query(`SELECT id, created_at, email, crm, host, ext_version, steps, bytes, ready, gaps, handled_at FROM autotasks_diagnostics ORDER BY created_at DESC LIMIT 100`);
+      res.json({ diagnostics: r.rows.map((x) => ({ ...x, kb: Math.round(x.bytes / 1024), view: `/api/tasks/diagnostics/${x.id}/view` })) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  router.get('/api/tasks/diagnostics/:id/report', admin, async (req, res) => {
+    try {
+      const row = await diagRow(req.params.id, false);
+      if (!row) return res.status(404).send('No such diagnostic');
+      res.type('text/plain').send((await lib()).buildReport({ ...row.payload, email: row.email }));
+    } catch (e) { res.status(500).send(e.message); }
+  });
+  router.get('/api/tasks/diagnostics/:id/bundle', admin, async (req, res) => {
+    try {
+      const row = await diagRow(req.params.id, true);
+      if (!row) return res.status(404).json({ error: 'No such diagnostic' });
+      const slug = String(row.crm || row.host || 'crm').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+      res.set('Content-Disposition', `attachment; filename="diagnostic-${row.id}-${slug}.json"`);
+      res.json({ id: row.id, created_at: row.created_at, ...row.payload, email: row.email, screenshots: row.shots || [] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  router.get('/api/tasks/diagnostics/:id/shot/:n.jpg', admin, async (req, res) => {
+    try {
+      const row = await diagRow(req.params.id, true);
+      const s = row && (row.shots || [])[Number(req.params.n)];
+      if (!s) return res.status(404).send('No such screenshot');
+      res.type('image/jpeg').send(Buffer.from(s.jpg, 'base64'));
+    } catch (e) { res.status(500).send(e.message); }
+  });
+  router.get('/api/tasks/diagnostics/:id/view', admin, async (req, res) => {
+    try {
+      const row = await diagRow(req.params.id, true);
+      if (!row) return res.status(404).send('No such diagnostic');
+      const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+      const q = `secret=${encodeURIComponent(req.query.secret || '')}`;
+      const imgs = (row.shots || []).map((s, i) => `<figure><img src="/api/tasks/diagnostics/${row.id}/shot/${i}.jpg?${q}" style="max-width:520px;border:1px solid #444"><figcaption>${esc(s.label)} (${esc(s.window)})</figcaption></figure>`).join('');
+      const report = (await lib()).buildReport({ ...row.payload, email: row.email });
+      res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Diagnostic #${row.id}</title><body style="font:13px system-ui;background:#111;color:#ddd;margin:20px"><h2>Diagnostic #${row.id}: ${esc(row.crm || row.host)}</h2><p><a style="color:#8cf" href="report?${q}">plain text</a> · <a style="color:#8cf" href="bundle?${q}">full JSON</a></p><div style="display:flex;flex-wrap:wrap;gap:12px">${imgs}</div><pre style="white-space:pre-wrap;font:12px ui-monospace,monospace">${esc(report)}</pre>`);
+    } catch (e) { res.status(500).send(e.message); }
   });
 
   router.get('/api/tasks/captures/:id', admin, async (req, res) => {
