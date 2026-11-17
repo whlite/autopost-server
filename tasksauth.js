@@ -66,6 +66,11 @@ const blockedList = () => String(process.env.TASKS_BLOCKED_EMAILS || '').split('
 const isBlocked = (email) => !!email && !isOwner(email) && blockedList().includes(normEmail(email));
 const compList = () => OWNER_EMAILS.concat(String(process.env.TASKS_ACTIVE_EMAILS || '').split(',').map(normEmail).filter(Boolean));
 const isAllowedStatus = (st) => ['active', 'trialing'].includes(String(st || '').toLowerCase());
+// FREE BETA: while this is on, anyone who signs in with AutoTasks' Clerk (email, phone, ...) is let in with no
+// payment and no Stripe. Their row is still saved (status stays 'inactive') and the owner still gets the signup
+// alert, so nothing is lost when paying starts. Set TASKS_BETA_FREE=0 in Railway to go back to paid-only; the
+// blocked list and the owner rules are unchanged either way.
+const betaFree = () => String(process.env.TASKS_BETA_FREE == null ? '1' : process.env.TASKS_BETA_FREE).trim() !== '0';
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
@@ -169,6 +174,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   /** Is this signed-in person allowed in right now? */
   async function allowed(session) {
     if (compList().includes(normEmail(session.email))) return true;
+    if (betaFree()) return true; // free beta: signing in is enough (the blocked list was already checked in verify)
     if (!pool) return false;
     const hit = statusCache.get(session.sub);
     if (hit && Date.now() - hit.at < STATUS_CACHE_MS) return hit.ok;
@@ -240,7 +246,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
       if (!email) return res.status(400).json({ success: false, error: 'Could not read your email. Sign in again.' });
       if (isBlocked(email)) return res.status(403).json({ success: false, error: 'This AutoTasks account is turned off.' });
       const name = [u.firstName, u.lastName].filter(Boolean).join(' ');
-      if (!pool && !compList().includes(email)) {
+      if (!pool && !compList().includes(email) && !betaFree()) {
         return res.status(503).json({ success: false, error: 'AutoTasks accounts are unavailable. Try again in a minute.' });
       }
       if (pool) {
@@ -250,11 +256,11 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
           console.log('[tasksauth] NEW signup (inactive):', email);
           if (notify && notify.captureLead) {
             notify.captureLead({ email, name, source: 'autotasks',
-              notes: `AutoTasks signup waiting. Turn on: UPDATE autotasks_users SET subscription_status='active' WHERE email='${email}';` })
+              notes: betaFree() ? 'AutoTasks FREE BETA signup (signed in with Clerk, no payment).' : `AutoTasks signup waiting. Turn on: UPDATE autotasks_users SET subscription_status='active' WHERE email='${email}';` })
               .catch((e) => console.error('[tasksauth] signup alert failed:', e.message));
           }
         }
-        if (!isAllowedStatus(row.status) && !compList().includes(email)) {
+        if (!betaFree() && !isAllowedStatus(row.status) && !compList().includes(email)) {
           console.log('[tasksauth] DENIED (status ' + row.status + ') for', email);
           return res.status(402).json({ success: false, error: NOT_ACTIVE });
         }
