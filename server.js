@@ -11,6 +11,7 @@ const createPhotoScene = require('./photoscene');
 const createProspecting = require('./prospecting');
 const createTasksAi = require('./tasksai');
 const createTasksAuth = require('./tasksauth');
+const createTasksCapture = require('./taskscapture');
 
 const app = express();
 
@@ -630,6 +631,8 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 const tasksAuth = createTasksAuth({ sessionSecret: SESSION_SECRET, pool, notify });
 app.use(tasksAuth.router);
 app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY, verifyUser: tasksAuth.check }));
+// AutoTasks 1.4: testers on a CRM we don't support yet send a masked map of their pages (taskscapture.js).
+app.use(createTasksCapture({ pool, verifyToken: tasksAuth.verify, notify, adminSecret: ADMIN_SECRET }).router);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(clerkMiddleware());
