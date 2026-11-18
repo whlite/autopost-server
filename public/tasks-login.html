@@ -410,11 +410,11 @@ button:disabled{
     const res  = await fetch(SERVER + "/api/tasks/auth/config");
     const data = await res.json();
     if (!res.ok || !data.publishableKey) throw new Error("AutoTasks sign in isn't set up yet. Tell your AutoTasks contact.");
-    return { clerkPublishableKey: data.publishableKey };
+    return { clerkPublishableKey: data.publishableKey, loginOrigin: data.loginOrigin || "", handoffOrigin: data.handoffOrigin || "" };
   }
 
-  async function initClerk() {
-    const config = await getPublicConfig();
+  async function initClerk(config) {
+    config = config || await getPublicConfig();
     clerkPublishableKey = config.clerkPublishableKey;
 
     const frontendApi = getFrontendApiFromPublishableKey(clerkPublishableKey);
@@ -495,7 +495,7 @@ button:disabled{
     connectBtn.textContent = "Connect extension";
   }
 
-  async function connectExtension() {
+  async function connectExtension(preset) {
     // Re-entry guard: ignore double-clicks / a click after success.
     if (connecting || connected) return;
     try {
@@ -505,6 +505,10 @@ button:disabled{
       hide(subscribeBtn);
       setStatus("Checking your AutoTasks account...", "");
 
+      // HANDOFF: a sign-in finished on the login domain (app.tryautopost.com) and bounced back here
+      // with the AutoTasks token already minted. Skip Clerk and go straight to step 4.
+      let data = (preset && preset.token) ? preset : null;
+      if (!data) {
       // Signed in but the Clerk session went stale → recover gracefully instead
       // of dead-ending. Refresh the page state and ask them to retry.
       if (!clerk) { resetConnectBtn(); setStatus("Sign-in is still loading. Refresh the page and try again.", "bad"); return; }
@@ -544,7 +548,6 @@ button:disabled{
         setStatus("The AutoTasks server didn't respond. Wait a minute and click Connect again.", "bad");
         return;
       }
-      let data = null;
       try { data = await res.json(); } catch (e) { data = null; }
       if (!data) {
         resetConnectBtn();
@@ -560,8 +563,18 @@ button:disabled{
         show(subscribeBtn);
         return;
       }
+      } // end: mint a new token (skipped on a handoff)
 
       setStatus("Account ready. Connecting AutoTasks...", "good");
+
+      // On the login domain, the installed extension only listens to the original server address, so
+      // bounce back there with the token in the URL fragment (never sent to any server) and let that
+      // page hand it to the extension exactly as before.
+      if (!preset && LOGIN_ORIGIN && HANDOFF_ORIGIN && window.location.origin === LOGIN_ORIGIN && HANDOFF_ORIGIN !== LOGIN_ORIGIN) {
+        const packed = toB64url(JSON.stringify({ token: data.token, expiresInSeconds: data.expiresInSeconds, user: data.user }));
+        window.location.replace(HANDOFF_ORIGIN + "/tasks/login" + window.location.search + "#att=" + packed);
+        return;
+      }
 
       // 4. Hand the token to the extension. We NEVER pre-ping and NEVER block on
       //    a ping — the installed (published) extension may not answer a ping but
@@ -653,11 +666,57 @@ button:disabled{
     }
   }
 
+  // ── Login-domain handoff ──
+  // Clerk production only runs on tryautopost.com, but the published extension opens and trusts the
+  // original server address. So: original address → sign in on the login domain → bounce back with the
+  // token in #att= → this page delivers it to the extension. Off unless TASKS_LOGIN_ORIGIN is set.
+  let LOGIN_ORIGIN = "";
+  let HANDOFF_ORIGIN = "";
+  let handoffData = null;
+
+  function toB64url(str) {
+    return btoa(unescape(encodeURIComponent(str))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64url(str) {
+    str = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (str.length % 4) str += "=";
+    return decodeURIComponent(escape(atob(str)));
+  }
+
   signInBtn.addEventListener("click",  goToSignIn);
-  connectBtn.addEventListener("click", connectExtension);
+  connectBtn.addEventListener("click", () => connectExtension(handoffData));
   signOutBtn.addEventListener("click", signOut);
 
-  initClerk().catch((e) => {
+  (async function boot() {
+    // 1. Returning from the login domain with a token: deliver it, no Clerk needed.
+    const m = (window.location.hash || "").match(/^#att=([A-Za-z0-9_-]+)$/);
+    if (m) {
+      try { history.replaceState(null, "", window.location.pathname + window.location.search); } catch (e) {}
+      try {
+        handoffData = JSON.parse(fromB64url(m[1]));
+        if (handoffData && handoffData.token) {
+          hide(signInBtn); show(connectBtn);
+          await connectExtension(handoffData);
+          return;
+        }
+      } catch (e) { handoffData = null; }
+      setStatus("That sign-in link didn't work. Sign in again.", "bad");
+    }
+
+    const config = await getPublicConfig();
+    LOGIN_ORIGIN = (config.loginOrigin || "").replace(/\/$/, "");
+    HANDOFF_ORIGIN = (config.handoffOrigin || "").replace(/\/$/, "");
+
+    // 2. Opened on the original server address: send them to the login domain to sign in.
+    if (LOGIN_ORIGIN && window.location.origin !== LOGIN_ORIGIN) {
+      setStatus("Opening secure sign in...", "");
+      window.location.replace(LOGIN_ORIGIN + "/tasks/login" + window.location.search);
+      return;
+    }
+
+    // 3. Normal sign-in on this page.
+    await initClerk(config);
+  })().catch((e) => {
     loadError = e.message || "Could not load AutoTasks sign in. Refresh the page.";
     setStatus(loadError, "bad");
     show(signInBtn);
