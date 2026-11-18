@@ -223,7 +223,15 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   });
 
   router.get('/api/tasks/auth/config', (req, res) => {
-    res.json({ configured: !!(SECRET_KEY && PUBLISHABLE_KEY), publishableKey: PUBLISHABLE_KEY });
+    // TASKS_LOGIN_ORIGIN: where sign-in runs (must be on the Clerk production domain, e.g.
+    //   https://app.tryautopost.com). Unset = sign in right here, as before.
+    // TASKS_HANDOFF_ORIGIN: the address the published extension trusts; the login page bounces back
+    //   there to hand the token over. Defaults to the Railway address.
+    const loginOrigin = String(process.env.TASKS_LOGIN_ORIGIN || '').trim().replace(/\/$/, '');
+    const handoffOrigin = String(process.env.TASKS_HANDOFF_ORIGIN || 'https://autopost-server-production.up.railway.app').trim().replace(/\/$/, '');
+    res.set('Cache-Control', 'no-store');
+    res.json({ configured: !!(SECRET_KEY && PUBLISHABLE_KEY), publishableKey: PUBLISHABLE_KEY,
+      loginOrigin, handoffOrigin: loginOrigin ? handoffOrigin : '' });
   });
 
   router.post('/api/tasks/auth/create-token', express.json({ limit: '16kb' }), async (req, res) => {
