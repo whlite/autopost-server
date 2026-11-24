@@ -91,13 +91,23 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
   });
 
   const hits = new Map(); // sender -> [times]: a tester sends a handful, never hundreds
-  function tooMany(key) {
+  function tooMany(key, max = 40) {
     const now = Date.now();
     const list = (hits.get(key) || []).filter((t) => now - t < 3600000);
-    if (list.length >= 40) return true;
+    if (list.length >= max) return true;
     hits.set(key, list.concat(now));
+    if (hits.size > 5000) for (const [k, v] of hits) if (!v.some((t) => now - t < 3600000)) hits.delete(k);
     return false;
   }
+  // SECURITY (2.2): a made-up install id is not a sender. Uploads are big (a diagnostic can be 25 MB) and land in the
+  // same Neon database AutoPost runs on, so only a real AutoTasks sign-in may send them, braked per person AND per
+  // network address (the last x-forwarded-for entry, which Railway's edge adds; earlier ones are the caller's).
+  // TASKS_AUTH_REQUIRED=0 lets the old install ids through again, like the AI relay.
+  const AUTH_REQUIRED = !/^(0|false|no|off)$/i.test(String(process.env.TASKS_AUTH_REQUIRED || '').trim());
+  const ipOf = (req) => {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    return fwd[fwd.length - 1] || String(req.ip || '');
+  };
 
   router.post('/api/tasks/capture', express.json({ limit: MAX_BYTES }), async (req, res) => {
     const b = req.body || {};
@@ -112,11 +122,11 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
       const v = verifyToken ? verifyToken(token) : { valid: false };
       if (!v.valid) return res.status(401).json({ success: false, error: 'Your sign-in expired. Sign in again, then tap Capture.' });
       email = String(v.session.email || '').toLowerCase();
-    } else if (!INSTALL_RE.test(String(b.install || ''))) {
+    } else if (AUTH_REQUIRED || !INSTALL_RE.test(String(b.install || ''))) {
       return res.status(401).json({ success: false, error: 'Sign in to AutoTasks first, then tap Capture.' });
     }
-    const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
-    if (tooMany(email || b.install || ip)) return res.status(429).json({ success: false, error: 'That is a lot of captures. Try again in an hour.' });
+    const ip = ipOf(req);
+    if (tooMany(email || b.install || ip, 20) || tooMany('ip:' + ip, 30)) return res.status(429).json({ success: false, error: 'That is a lot of captures. Try again in an hour.' });
 
     const kind = KINDS.includes(b.kind) ? b.kind : 'other';
     const crm = clean(b.crm, 80);
@@ -155,10 +165,10 @@ module.exports = function createTasksCapture({ pool, verifyToken, notify, adminS
       const v = verifyToken ? verifyToken(token) : { valid: false };
       if (!v.valid) return res.status(401).json({ success: false, error: 'Your sign-in expired. Sign in again, then press Submit.' });
       email = String(v.session.email || '').toLowerCase();
-    } else if (!INSTALL_RE.test(String(b.install || ''))) {
+    } else if (AUTH_REQUIRED || !INSTALL_RE.test(String(b.install || ''))) {
       return res.status(401).json({ success: false, error: 'Sign in to AutoTasks first, then press Submit.' });
     }
-    if (tooMany('diag:' + (email || b.install))) return res.status(429).json({ success: false, error: 'That is a lot of diagnostics. Try again in an hour.' });
+    if (tooMany('diag:' + (email || b.install), 6) || tooMany('diag-ip:' + ipOf(req), 10)) return res.status(429).json({ success: false, error: 'That is a lot of diagnostics. Try again in an hour.' });
     try {
       await initDiag();
       // screenshots live in their own column so lists stay light

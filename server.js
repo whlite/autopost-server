@@ -12,6 +12,7 @@ const createProspecting = require('./prospecting');
 const createTasksAi = require('./tasksai');
 const createTasksAuth = require('./tasksauth');
 const createTasksCapture = require('./taskscapture');
+const createTasksBugs = require('./tasksbugs');
 
 const app = express();
 
@@ -633,6 +634,8 @@ app.use(tasksAuth.router);
 app.use(createTasksAi({ apiKey: ANTHROPIC_API_KEY, verifyUser: tasksAuth.check }));
 // AutoTasks 1.4: testers on a CRM we don't support yet send a masked map of their pages (taskscapture.js).
 app.use(createTasksCapture({ pool, verifyToken: tasksAuth.verify, notify, adminSecret: ADMIN_SECRET }).router);
+// AutoTasks 2.1+: Report a bug (tasksbugs.js). The owner reads them at /api/tasks/bugs/board?secret=ADMIN_SECRET.
+app.use(createTasksBugs({ pool, verifyToken: tasksAuth.verify, adminSecret: ADMIN_SECRET }).router);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(clerkMiddleware());

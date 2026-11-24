@@ -182,6 +182,7 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     const r = await pool.query('SELECT subscription_status FROM autotasks_users WHERE clerk_user_id = $1 OR LOWER(email) = $2 LIMIT 1',
       [session.sub, normEmail(session.email)]);
     const ok = !!r.rows[0] && isAllowedStatus(r.rows[0].subscription_status);
+    if (statusCache.size > 5000) statusCache.clear(); // a 60s cache: dropping it costs one query each, never a leak
     statusCache.set(session.sub, { ok, at: Date.now() });
     return ok;
   }
@@ -289,11 +290,16 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
   router.post('/api/tasks/signup', express.json({ limit: '16kb' }), async (req, res) => {
     const b = req.body || {};
     if (b.company_site) return res.json({ success: true, checkoutUrl: STRIPE_LINK }); // honeypot: bots get the plain link
-    const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    // The LAST x-forwarded-for entry is the one Railway's edge added; earlier entries are whatever the caller sent,
+    // so keying on the first one let a bot skip the brake by making up a new address on every request.
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    const ip = fwd[fwd.length - 1] || String(req.ip || '');
     const now = Date.now();
     const hits = (signupHits.get(ip) || []).filter((t) => now - t < 3600000);
     if (hits.length >= 12) return res.status(429).json({ success: false, error: 'Too many tries. Wait a few minutes and try again.' });
     signupHits.set(ip, hits.concat(now));
+    // Forget old addresses so this map can't grow for as long as the server runs.
+    if (signupHits.size > 5000) for (const [k, v] of signupHits) if (!v.some((t) => now - t < 3600000)) signupHits.delete(k);
 
     const first = clean(b.first_name, 60), last = clean(b.last_name, 60);
     const email = normEmail(clean(b.email, 200));
@@ -325,10 +331,13 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
           `INSERT INTO autotasks_users (clerk_user_id, email, name, phone, dealership, dealer_website, crm, last_seen_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
            ON CONFLICT (email) DO UPDATE SET clerk_user_id = COALESCE(autotasks_users.clerk_user_id, EXCLUDED.clerk_user_id),
-             name = EXCLUDED.name, phone = COALESCE(NULLIF(EXCLUDED.phone, ''), autotasks_users.phone),
-             dealership = COALESCE(NULLIF(EXCLUDED.dealership, ''), autotasks_users.dealership),
-             dealer_website = COALESCE(NULLIF(EXCLUDED.dealer_website, ''), autotasks_users.dealer_website),
-             crm = EXCLUDED.crm, updated_at = NOW()`,
+             -- 2.2: this form needs no sign-in, so anyone can type someone else's email. Only FILL blanks on an
+             -- existing account, never overwrite what the owner already gave us.
+             name = COALESCE(NULLIF(autotasks_users.name, ''), EXCLUDED.name),
+             phone = COALESCE(NULLIF(autotasks_users.phone, ''), NULLIF(EXCLUDED.phone, '')),
+             dealership = COALESCE(NULLIF(autotasks_users.dealership, ''), NULLIF(EXCLUDED.dealership, '')),
+             dealer_website = COALESCE(NULLIF(autotasks_users.dealer_website, ''), NULLIF(EXCLUDED.dealer_website, '')),
+             crm = COALESCE(NULLIF(autotasks_users.crm, ''), EXCLUDED.crm), updated_at = NOW()`,
           [user.id, email, name, phone, dealership, website, crm]);
       }
       if (notify && notify.captureLead) {

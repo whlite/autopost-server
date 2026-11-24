@@ -22,8 +22,8 @@
 //   - Days roll over at midnight TASKS_AI_TZ (default America/Denver).
 //   - Kill switch: TASKS_AI_OFF=1.
 //   - Blocks: TASKS_AI_BLOCKED_INSTALLS (comma-separated install ids or account emails).
-//   - Sign-in: 1.2+ sends an AutoTasks token (tasksauth.js), capped per person. TASKS_AUTH_REQUIRED=1 refuses
-//     the old bare install ids.
+//   - Sign-in: 1.2+ sends an AutoTasks token (tasksauth.js), capped per person. Bare install ids are refused
+//     unless TASKS_AUTH_REQUIRED=0.
 //   Counts are in memory: a redeploy resets the day, which only ever errs
 //   toward letting reps keep working.
 //
@@ -43,8 +43,10 @@ const DAY_TZ = process.env.TASKS_AI_TZ || 'America/Denver';
 const OFF = /^(1|true|yes|on)$/i.test(String(process.env.TASKS_AI_OFF || ''));
 const BLOCKED = new Set(String(process.env.TASKS_AI_BLOCKED_INSTALLS || '').split(',').map((s) => s.trim()).filter(Boolean));
 const INSTALL_RE = /^at_[a-f0-9]{32}$/;
-// Once every rep is on AutoTasks 1.2+ (sign-in), set TASKS_AUTH_REQUIRED=1 so bare install ids stop working.
-const AUTH_REQUIRED = /^(1|true|yes|on)$/i.test(String(process.env.TASKS_AUTH_REQUIRED || ''));
+// SECURITY (2.2): sign-in is REQUIRED by default. A bare install id ("at_" + 32 hex) is something anyone can make up,
+// so accepting them turned this relay into free Claude for anyone who read the extension's files (up to the whole
+// daily budget, by rotating ids). Every AutoTasks since 1.2 signs in. TASKS_AUTH_REQUIRED=0 reopens it (emergency only).
+const AUTH_REQUIRED = !/^(0|false|no|off)$/i.test(String(process.env.TASKS_AUTH_REQUIRED || '').trim());
 const TIMEOUT_MS = 120000;
 
 // Dollars per million tokens: [input, output]. Fast mode (speed: "fast") is 2x on Opus.
