@@ -34,6 +34,9 @@
 //   GET  /api/tasks/auth/config          { configured, publishableKey }
 //   POST /api/tasks/auth/create-token    Clerk session JWT -> { token, expiresInSeconds, user }
 //   POST /api/tasks/auth/verify          { token } -> { valid, user }
+//   POST /api/tasks/auth/download        Clerk session JWT -> { success, storeUrl } for someone who ALREADY has an
+//                                        AutoTasks account (the website's "Already have AutoTasks? Sign in to
+//                                        download"). Never creates an account or mints a token.
 //   POST /api/tasks/signup               the website's signup form: creates their AutoTasks login (Clerk,
 //                                        no password: they sign in with an emailed code), saves name, phone,
 //                                        dealership and CRM on their autotasks_users row (inactive until
@@ -283,6 +286,45 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     }
   });
 
+  // ---- 2.2: returning users get the download again by signing in (no second signup form)
+  const STORE_URL = process.env.TASKS_STORE_URL || 'https://chromewebstore.google.com/detail/autotasks/jlpjphljkephhfjlijhkjncankhkhlaa';
+  router.post('/api/tasks/auth/download', express.json({ limit: '4kb' }), async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!clerk || !PUBLISHABLE_KEY) return res.status(503).json({ success: false, error: 'Sign in is down for a minute. Try again shortly.' });
+    const jwt = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    if (!jwt) return res.status(401).json({ success: false, error: 'Please sign in first.' });
+    let claims;
+    try { claims = await verifyToken(jwt, { secretKey: SECRET_KEY }); } catch (e) {
+      return res.status(401).json({ success: false, error: 'Your sign-in expired. Sign in again.' });
+    }
+    try {
+      const u = await clerk.users.getUser(claims.sub);
+      const list = (u && u.emailAddresses) || [];
+      const primary = list.find((e) => e.id === u.primaryEmailAddressId) || list[0];
+      const email = normEmail(primary && primary.emailAddress);
+      if (!email) return res.status(400).json({ success: false, error: 'Could not read your email. Sign in again.' });
+      if (isBlocked(email)) return res.status(403).json({ success: false, error: 'This AutoTasks account is turned off. Email tryautopost@gmail.com.' });
+      let row = null;
+      if (pool) {
+        await initSchema();
+        const r = await pool.query('SELECT subscription_status FROM autotasks_users WHERE clerk_user_id = $1 OR LOWER(email) = $2 LIMIT 1', [claims.sub, email]);
+        row = r.rows[0] || null;
+      }
+      const comped = compList().includes(email);
+      if (!row && !comped) {
+        // Signed in to Clerk but never signed up for AutoTasks: the signup form collects their info first.
+        return res.status(404).json({ success: false, needsSignup: true, error: "We couldn't find an AutoTasks account for " + email + '. Sign up first, it takes a minute.' });
+      }
+      if (!comped && !betaFree() && !isAllowedStatus(row.status || row.subscription_status)) {
+        return res.status(402).json({ success: false, inactive: true, error: NOT_ACTIVE });
+      }
+      return res.json({ success: true, storeUrl: STORE_URL, user: { email, first: String(u.firstName || '') } });
+    } catch (e) {
+      console.error('[tasksauth] download check error:', e.message);
+      return res.status(500).json({ success: false, error: 'Server error. Try again.' });
+    }
+  });
+
   // ---- website signup: create the login + save their info, then send them to Stripe
   const STRIPE_LINK = process.env.TASKS_STRIPE_LINK || 'https://buy.stripe.com/dRmbJ193c0tvb2e3Rr4gg05';
   const signupHits = new Map(); // ip -> [times], a light brake on bots
@@ -368,6 +410,15 @@ module.exports = function createTasksAuth({ sessionSecret, pool, notify }) {
     res.set('Cache-Control', 'no-store');
     res.set('X-Robots-Tag', 'noindex');
     res.sendFile(path.join(__dirname, 'public', 'tasks-login.html'));
+  });
+
+  // 2.2: "Already have AutoTasks? Sign in to download" (tryautopost.com/tasks-download forwards here). It lives on
+  // this server because the AutoTasks Clerk app only runs on app.tryautopost.com and its subdomains.
+  router.get(['/tasks/download', '/tasks/download.html'], (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Robots-Tag', 'noindex');
+    res.set('X-Frame-Options', 'DENY');
+    res.sendFile(path.join(__dirname, 'public', 'tasks-download.html'));
   });
 
   // AutoTasks privacy policy (the Chrome Web Store listing links here).
